@@ -21,7 +21,7 @@ warnings.filterwarnings('ignore')
 import gc
 import sys
 
-POLARIZATION_RANGE = "HIGH_POL"  # Options: HIGH_POL (2% - 60), LOW_POL (TE - 2%)
+POLARIZATION_RANGE = "LOW_POL"  # Options: HIGH_POL (2% - 60), LOW_POL (TE - 2%)
 USE_SE_BLOCK = POLARIZATION_RANGE == "LOW_POL"
 
 sys.stdout.flush()
@@ -431,8 +431,8 @@ def main():
     print(f"Using device: {device} (Lightning accelerator={ACCELERATOR})")
     print(f"Polarization range: {POLARIZATION_RANGE} (SE block {'on' if USE_SE_BLOCK else 'off'})")
 
-    data_path = "TE_500K_No_Gain_TE.parquet"
-    version = 'HighPol_CNN_TE_V5'
+    data_path = "TE_50K.parquet"
+    version = 'CNN_TE_V4'
     performance_dir = f"Model_Performance/{version}"
     model_dir = f"Models/{version}"
     os.makedirs(performance_dir, exist_ok=True)
@@ -447,18 +447,19 @@ def main():
     scaler = MinMaxScaler()
     scaler_area = MinMaxScaler()
 
+    scaler.fit(df[signal_cols].values.astype('float32'))
+    scaler_area.fit(df['Area'].values.astype('float32').reshape(-1, 1))
+
     # Split on raw (unscaled) data first so the scaler never sees test/val statistics.
-    train_data, temp_data = train_test_split(df, test_size=0.2, random_state=42)
-    val_data, test_data = train_test_split(temp_data, test_size=1 / 3, random_state=42)
-    del df, temp_data
+    df_train, df_temp = train_test_split(df, test_size=0.2, random_state=42)
+    df_val, df_test = train_test_split(df_temp, test_size=1 / 3, random_state=42)
+    del df, df_temp
     gc.collect()
 
     # Fit scalers exclusively on training rows, then transform each split separately.
-    X_train = scaler.fit_transform(train_data[signal_cols].values.astype('float32'))
-    X_val = scaler.transform(val_data[signal_cols].values.astype('float32'))
-    X_test = scaler.transform(test_data[signal_cols].values.astype('float32'))
-
-    scaler_area.fit(train_data['Area'].values.astype('float32').reshape(-1, 1))
+    X_train = scaler.transform(df_train[signal_cols].values.astype('float32'))
+    X_val = scaler.transform(df_val[signal_cols].values.astype('float32'))
+    X_test = scaler.transform(df_test[signal_cols].values.astype('float32'))
 
     with open(scaler_path, 'wb') as f:
         pickle.dump(scaler, f)
@@ -471,22 +472,22 @@ def main():
 
     print(f"Scaled signal range (train): {X_train.min():.4f} to {X_train.max():.4f}")
 
-    y_train = train_data["P"].values.astype('float32').reshape(-1, 1)
-    y_val = val_data["P"].values.astype('float32').reshape(-1, 1)
-    y_test = test_data["P"].values.astype('float32').reshape(-1, 1)
-    test_SNR = test_data["SNR"].values.astype('float32')
+    y_train = df_train["P"].values.astype('float32').reshape(-1, 1)
+    y_val = df_val["P"].values.astype('float32').reshape(-1, 1)
+    y_test = df_test["P"].values.astype('float32').reshape(-1, 1)
+    test_SNR = df_test["SNR"].values.astype('float32')
 
-    print(f"Number of training data points: {len(train_data)}")
+    print(f"Number of training data points: {len(df_train)}")
 
-    del train_data, val_data, test_data
+    del df_train, df_val, df_test
     gc.collect()
     if torch.backends.mps.is_available():
         torch.mps.empty_cache()
 
     num_workers = min(4, os.cpu_count() or 1)
     learning_rate = 3e-4
-    max_epochs = 500
-    batch_size = 256
+    max_epochs = 100
+    batch_size = 512
     input_length = len(X_train[0])
     
     print("\n" + "=" * 60)

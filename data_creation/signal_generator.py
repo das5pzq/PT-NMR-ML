@@ -21,7 +21,7 @@ import tqdm
 from scipy.integrate import trapezoid
 from scipy.signal import hilbert
 
-from Lineshape import (
+from physics.Lineshape import (
     Baseline,
     GenerateVectorLineshape,
     Lineshape,
@@ -72,7 +72,7 @@ class BaselineConfig:
     phi: float = 2*np.pi
     # Cknob: float = 0.0647
     vary_baseline: bool = True
-    U_range: Tuple[float, float] = (5.0, 10.0)
+    U_range: Tuple[float, float] = (0.1, 1.0)
     Cknob_range: Tuple[float, float] = (0.15, 0.3)
     # Cknob_range: Tuple[float, float] = (0.0477, 0.0647)
     phase_range: Tuple[float, float] = (2*np.pi * .80, 2 * np.pi * 1.20)
@@ -562,7 +562,7 @@ class SignalGenerator:
                         area_arr.append(area)
 
                 snr_arr.append(self._calculate_snr(lineshape, noise))
-                if (i + 1) % 100 == 0:
+                if (i + 1) % 10000 == 0:
                     self.logger.info("Generated %d/%d samples", i + 1, len(p_values))
 
             p_column = np.array(p_list, dtype=np.float64)
