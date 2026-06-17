@@ -1,17 +1,51 @@
-# Scripts
+# ML scripts
 
-## `area.py` ##
+Training scripts for NMR polarization and signal models. Each script reads a parquet dataset, trains a model, and writes checkpoints and metrics under `Models/` and `Model_Performance/`.
 
-This script is specific for Spin-1/2 sample data. It uses a 2-layer neural network with a flag to switch to training a linear ridge-regression model. Both perform exceptionally well, with the neural network outperforming the RR model. 
+## Scripts
 
-## `pol_cnn.py` ##
+| Script | Purpose |
+|--------|---------|
+| `area.py` | Predicts signal **area** from a 500-bin lineshape for **Spin-1/2** data. Uses a small MLP (or linear ridge regression if `HIDDEN = []`). Supports `--data_file` and `--reload` for prediction-only runs. |
+| `pol_cnn.py` | Predicts **polarization** from lineshape for **Spin-1 non-cubic** materials using the paper's CNN (residual blocks, optional SE block for low-polarization). Edit `data_path`, `version`, and `POLARIZATION_RANGE` at the top of `main()`. |
+| `pol_mlp.py` | Simpler 2-layer MLP for **Spin-1** polarization, aimed at the higher-polarization range (roughly 2–60%). Edit `data_path` and `version` in the `__main__` block. |
+| `dae.py` | **Denoising autoencoder** that reconstructs clean Spin-1 lineshapes from noisy input. Edit `version` and the parquet path in the `__main__` block. |
 
-This script implements the CNN architecture described within the paper for Spin-1 non-cubic symmetric materials. Hyperparameters can vary, but the overall architecture is implemented here. An optional flag to turn on and off the Squeeze-and-Excitation block (described in [Hu's paper](https://arxiv.org/abs/1709.01507)) exists at the beginning for whether or not to use it for low-polarization / high-polarization. Additionally, [residual connections](https://arxiv.org/abs/1512.03385) are implemented alongside an [inception](https://arxiv.org/abs/1409.4842)-style block.
+## Run locally
 
-## `pol_mlp.py` ##    
+From the repo root (or `ml/`), with your data file in place:
 
-This script implements a simple 2-layer neural network for Spin-1 non-cubic symmetric materials designed primarily for the higher polarization range (2\\% - 60\\%) of ND3, primarily because the relationship between the lineshape and polarization is far more linear than when nearning the TE region ($P_{TE}$ ~ 0.05% for ND3 at B = 5T), though it can also be used for events near TE. 
+```bash
+python ml/area.py --data_file path/to/data.parquet
+python ml/pol_cnn.py
+python ml/pol_mlp.py
+python ml/dae.py
+```
 
-## `dae.py` ##   
+Most scripts expect parquet files with 500 signal columns plus target columns (`Area`, `P`, etc.). Check the `data_path` / `--data_file` setting in each script before running.
 
-This script implements a [Denoising Autoencoder (DAE)](https://www.cs.toronto.edu/~larocheh/publications/icml-2008-denoising-autoencoders.pdf) designed to ``denoise" a given Spin-1 signal. The script has currently only been used on Spin-1 simulated lineshape data by itself, not including a varied baseline, though it would be easy to extend the training to simulated data that with those characteristics, as well as Spin-1/2 sample events.
+## Submit a SLURM job
+
+`train.slurm` is a template batch script. Before submitting:
+
+1. Edit the `#SBATCH` lines for your cluster (partition, GPU type, account, email).
+2. Set the `module load` lines to match your site's PyTorch/Apptainer modules.
+3. Replace `sample_script.py` with the script you want to run (e.g. `pol_cnn.py`).
+4. Add any script arguments after the filename if needed (e.g. `area.py --data_file data.parquet`).
+
+Submit from the directory that contains the job script and your data:
+
+```bash
+cd ml
+sbatch train.slurm
+```
+
+Check status and output:
+
+```bash
+squeue -u $USER          # job status
+tail -f training.out     # stdout (name set by #SBATCH --output)
+tail -f training.err     # stderr
+```
+
+Cancel a job with `scancel <job_id>`.
