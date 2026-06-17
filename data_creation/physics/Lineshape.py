@@ -189,6 +189,27 @@ def GenerateVectorLineshape(P,x, CC, eta, phi, g):
 
     return signal,Iplus,Iminus
 
+def DulyaFit(x, P, scaling_factor, eta, phi, g):
+
+    r = (np.sqrt(4 - 3 * P ** 2) + P) / (2 - 2 * P)
+    if P > 0:
+        Iplus = r*Lineshape(x,1, eta, phi, g)
+        Iminus = Lineshape(x,-1, eta, phi, g)
+        r = r
+    else:
+        r = 1/r
+        Iplus = -Lineshape(x,1, eta, phi, g)
+        Iminus = -r*Lineshape(x,-1, eta, phi, g)
+
+    ### Scaling
+    pSummed = np.sum(Iplus + Iminus)
+    deltaP = (P/pSummed)*scaling_factor
+    Iplus = Iplus*deltaP
+    Iminus = Iminus*deltaP
+    signal = Iplus + Iminus
+
+    return signal
+
 def SamplingVectorLineshape(P, x, bound, CC, eta, phi, g):
     """Sampling the lineshape with a stochastic shift to frequency bins.
 
