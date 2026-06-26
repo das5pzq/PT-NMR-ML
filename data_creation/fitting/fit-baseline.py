@@ -53,23 +53,7 @@ print(f"freq range: {freq_mhz[0]:.4f} – {freq_mhz[-1]:.4f} MHz")
 print(f"keys per record: {sorted(records[0].keys())}")
 
 baseline_event = np.asarray(baseline_signals[INDEX])
-
-# fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
-# ax1.plot(freq_mhz, baseline_event, label="baseline")
-# ax1.set_xlabel("Frequency (MHz)")
-# ax1.set_ylabel("Voltage (V)")
-# ax1.set_title("Baseline")
-# ax1.grid(True)
-
-# ax2.plot(freq_mhz, signal_event, label="basesub")
-# ax2.set_xlabel("Frequency (MHz)")
-# ax2.set_ylabel("Voltage (V)")
-# ax2.set_title("Signal, baseline subtracted")
-# ax2.grid(True)
-
-# plt.tight_layout()
-# plt.show()
-
+x
 ##### Baseline Fitting #####
 
 p0 = (

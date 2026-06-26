@@ -1,15 +1,10 @@
 import json
-
 import matplotlib.pyplot as plt
 import numpy as np
 
-from fit_multisite import (
-    MULTISITE_MHZ_PARAM_ORDER,
-    fit_chi_squared,
-    fit_signal_mhz,
-    freq_bounds_to_window,
-    signal_model_mhz,
-)
+from model.dulya import *
+from model.baseline import *
+
 
 PATH = "../data/2022-07-21_00-22-36__2022-07-21_11-39-08.txt"
 VOLTAGE_KEY = "basesub"
@@ -36,31 +31,44 @@ K_BOUNDS = (0.0, 0.50)
 XI_BOUNDS = (-0.15, 0.15)
 CC_BOUNDS = (0.0, 1.5)
 
-F_LO0 = CENTER_MHZ - 0.2
-F_HI0 = CENTER_MHZ + 0.2
+PARAMS = {
+    "P": 0.4,              # deuteron vector polarization
+    "amp": 1.0,            # overall signal amplitude scale
+    "center": 0.0,         # frequency axis center shift
+    "cc": 0.8,             # x-axis calibration (x_eff = cc * (x - center))
+    "split_cd": 0.92,      # C-D site quadrupole scale 3*w_q
+    "split_od": 0.88,      # O-D site quadrupole scale 3*w_q
+    "sigma": 0.05,         # common dipolar linewidth width
+    "eta_od": 0.05,        # O-D quadrupole asymmetry parameter
+    "K": 0.15,             # O-D site fraction: (1-K)*CD + K*OD
+    "xi": 0.0,             # Q-meter false-asymmetry correction
+    "b0": 0.0,             # background polynomial constant term
+    "b1": 0.0,             # background polynomial linear term
+    "b2": 0.0,             # background polynomial quadratic term
+    "b3": 0.0,             # background polynomial cubic term
+    "wd": 32.68,           # deuteron Larmor frequency (MHz)
+    "eta_cd": 0.00,        # C-D quadrupole asymmetry parameter
+    "exact_intensity": True,  # use Dulya Eq. (24) vs weak-quadrupole approx
+    "nphi": 64,            # phi steps for powder average
+}
 
-PARAM_NAMES = MULTISITE_MHZ_PARAM_ORDER
-
-
-def subtract_polynomial_wings(
-    freq_mhz: np.ndarray,
-    signal: np.ndarray,
-    *,
-    edge_fraction: float = EDGE_FRACTION,
-    degree: int = POLYNOMIAL_DEGREE,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Fit a polynomial to the outer wings and return the detrended signal."""
-    n_bins = len(freq_mhz)
-    n_edge = max(degree + 1, int(n_bins * edge_fraction))
-    wing_mask = np.zeros(n_bins, dtype=bool)
-    wing_mask[:n_edge] = True
-    wing_mask[-n_edge:] = True
-
-    coeffs = np.polyfit(freq_mhz[wing_mask], signal[wing_mask], deg=degree)
-    polynomial = np.polyval(coeffs, freq_mhz)
-    detrended = signal - polynomial
-    return detrended, polynomial, wing_mask, coeffs
-
+FIT_BOUNDS = {
+    "P": (-0.99, 0.0),
+    "amp": (-np.inf, np.inf),
+    "center": (-1.0, 1.0),
+    "cc": (0.5, 1.5),
+    "split_cd": (1e-4, 1.0),
+    "split_od": (1e-4, 1.0),
+    "sigma": (0.0, 2.0),
+    "eta_od": (0.0, 2.0),
+    "eta_cd": (0.0, 0.00),
+    "K": (0.0, 1.0),
+    "xi": (-1.0, 1.0),
+    "b0": (-np.inf, np.inf),
+    "b1": (0.0, 0.0),
+    "b2": (0.0, 0.0),
+    "b3": (0.0, 0.0),
+}
 
 with open(PATH) as f:
     records = [json.loads(line) for line in f]
@@ -68,23 +76,21 @@ with open(PATH) as f:
 freq_mhz = np.asarray(records[0]["freq_list"])
 signal_event = np.asarray(records[INDEX][VOLTAGE_KEY])
 
-# ---- Subtracting out wings ----
+X_MIN = -5.0
+X_MAX = 5.5
 
-signal_detrended, y_polynomial_fit, wing_mask, coeffs = subtract_polynomial_wings(
-    freq_mhz,
+R = np.linspace(X_MIN, X_MAX, len(freq_mhz))
+
+### subtract polynomial wings
+
+signal_detrended, y_polynomial_fit, wing_mask, coeffs, chi_squared = subtract_polynomial_wings(
+    R,
     signal_event,
+    EDGE_FRACTION,
+    POLYNOMIAL_DEGREE,
 )
-polynomial_fit_rms = float(
-    np.sqrt(np.mean((signal_event[wing_mask] - y_polynomial_fit[wing_mask]) ** 2))
-)
-detrend_rms = float(np.sqrt(np.mean(signal_detrended**2)))
 
-p0_guess = float(np.clip(records[INDEX].get("pol", 0.2), *P_BOUNDS))
-
-print(f"Wing fit points: {wing_mask.sum()} / {len(freq_mhz)} bins")
-print(f"Polynomial fit RMS (on edges): {polynomial_fit_rms:.6g}")
-print(f"Detrended RMS (full spectrum): {detrend_rms:.6g}")
-print(f"Polynomial coeffs (high→low power): {coeffs}")
+print(f"Chi-squared = {chi_squared:.4g}")
 
 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
 
@@ -114,140 +120,73 @@ ax2.plot(freq_mhz, signal_detrended, color="tab:red", label="detrended")
 ax2.axhline(0.0, color="black", linewidth=0.8)
 ax2.set_xlabel("Frequency (MHz)")
 ax2.set_ylabel("Voltage (V)")
-ax2.set_title(f"After polynomial wing subtraction (RMS = {detrend_rms:.4g})")
+ax2.set_title(f"After polynomial wing subtraction (Chi-squared = {chi_squared:.4g})")
 ax2.legend()
 ax2.grid(True)
 
 plt.tight_layout()
 plt.show()
 
-# ---- Multi-site Dulya fit (fit_multisite) ----
+signal_detrended = signal_detrended[::-1]
 
-_freq_lo = F_LO0
-_freq_hi = F_HI0
-
-p0 = {
-    "P": p0_guess,
-    "amp": 1.0,
-    "f_lo_mhz": F_LO0,
-    "f_hi_mhz": F_HI0,
-    "cc": CC0,
-    "split_cd": SPLIT_CD0,
-    "split_od": SPLIT_OD0,
-    "sigma": SIGMA0,
-    "eta_od": ETA_OD0,
-    "K": K0,
-    "xi": XI0,
-    "b0": 0.0,
-    "b1": 0.0,
-    "b2": 0.0,
-    "b3": 0.0,
-}
-bounds = {
-    "P": P_BOUNDS,
-    "amp": (-np.inf, np.inf),
-    "f_lo_mhz": (_freq_lo, _freq_hi),
-    "f_hi_mhz": (_freq_lo, _freq_hi),
-    "cc": CC_BOUNDS,
-    "sigma": SIGMA_BOUNDS,
-    "eta_od": ETA_OD_BOUNDS,
-    "K": K_BOUNDS,
-    "xi": XI_BOUNDS,
-    "b0": (-np.inf, np.inf),
-    "b1": (0.0, 0.0),
-    "b2": (0.0, 0.0),
-    "b3": (0.0, 0.0),
-}
-fixed = {
-    "split_cd": SPLIT_CD0,
-    "split_od": SPLIT_OD0,
-    "b1": 0.0,
-    "b2": 0.0,
-    "b3": 0.0,
-}
-
-# signal_detrended = signal_detrended[::-1]
-# signal_detrended *= -1.0
+Y_ERR = np.ones_like(signal_detrended) * 1e-6
 
 
-fit = fit_signal_mhz(
-    freq_mhz,
-    signal_detrended,
-    p0=p0,
-    bounds=bounds,
-    fixed=fixed,
-    wd=16.35,
-    exact_intensity=False,
-    nphi=64,
-    loss="soft_l1",
-    max_nfev=100_000,
+
+### Fitting Dulya lineshape to data ###
+
+dulya_model = DulyaModel()
+fitted_params = dulya_model.fit_dulya(R, signal_detrended, Y_ERR, PARAMS, bounds=FIT_BOUNDS, method="Powell")
+
+print(f"===================== Fit Results =====================")
+for name in dulya_model.param_keys:
+    print(f"{name}: {fitted_params[name]:.6g}")
+print(f"-"*40)
+print(f"Chi-squared = {dulya_model.chi_squared(fitted_params, R, signal_detrended, Y_ERR):.4g}")
+print(f"===============================================================")
+
+curves = dulya_model.component_curves(fitted_params, R)
+
+fig, (ax, axr) = plt.subplots(2, 1, figsize=(9.0, 7.5), sharex=True, height_ratios=[3.2, 1.0])
+
+ax.plot(R, signal_detrended, "o", ms=3, alpha=0.85, label="data")
+ax.plot(R, curves["total"], lw=2.2, label="total fit")
+ax.plot(R, curves["cd_total"], lw=1.5, linestyle="--", label="C-D site")
+ax.plot(R, curves["od_total"], lw=1.5, linestyle=":", label="O-D site")
+ax.plot(R, curves["plus_total"], lw=1.2, linestyle="-.", label="plus branch")
+ax.plot(R, curves["minus_total"], lw=1.2, linestyle=(0, (5, 2, 1, 2)), label="minus branch")
+ax.plot(R, curves["background"], lw=1.0, alpha=0.8, label="background")
+ax.set_ylabel("Signal")
+ax.set_title("Dulya butanol fit")
+ax.grid(alpha=0.25)
+ax.legend(loc="best", ncols=2)
+
+txt = (
+    f"P = {fitted_params['P']:.5f}\n"
+    f"r = {dulya_model.p_to_r(fitted_params['P']):.5f}\n"
+    f"split_cd = {fitted_params['split_cd']:.5g}\n"
+    f"split_od = {fitted_params['split_od']:.5g}\n"
+    f"sigma = {fitted_params['sigma']:.5g}\n"
+    f"eta_od = {fitted_params['eta_od']:.5g}\n"
+    f"K = {fitted_params['K']:.5g}"
+)
+ax.text(
+    0.02,
+    0.98,
+    txt,
+    transform=ax.transAxes,
+    va="top",
+    ha="left",
+    fontsize=9,
+    bbox=dict(boxstyle="round", facecolor="white", alpha=0.78, lw=0.5),
 )
 
-params = fit.params
-fitted_signal = signal_model_mhz(
-    freq_mhz,
-    **params,
-    wd=16.35,
-    exact_intensity=False,
-    nphi=64,
-)
-fit_chi2 = fit_chi_squared(signal_detrended, fitted_signal)
-resonance_center_mhz, bracket_split_mhz = freq_bounds_to_window(
-    params["f_lo_mhz"],
-    params["f_hi_mhz"],
-)
+residuals = signal_detrended - curves["total"]
+axr.axhline(0.0, lw=1.0, alpha=0.8)
+axr.plot(R, residuals, "o", ms=3, alpha=0.85)
+axr.set_xlabel("Frequency / offset")
+axr.set_ylabel("resid")
+axr.grid(alpha=0.25)
 
-print("\nFitted parameters:")
-for name in PARAM_NAMES:
-    value = params[name]
-    if name in fixed:
-        print(f"  {name:16s} = {value:.6g}  (fixed)")
-    else:
-        lo, hi = bounds[name]
-        print(f"  {name:16s} = {value:.6g}  (bounds {lo:.4g} – {hi:.4g})")
-
-print(f"Chi-squared: {fit_chi2:.6g}")
-
-if "pol" in records[INDEX]:
-    print(f"P_true: {records[INDEX]['pol']:.6g}")
-
-print(f"Derived center: {resonance_center_mhz:.6g} MHz")
-print(f"Derived bracket split: {bracket_split_mhz:.6g} MHz (from f_lo/f_hi)")
-
-plt.figure(figsize=(10, 8))
-plt.plot(freq_mhz, signal_detrended, label="detrended", alpha=0.85)
-plt.plot(freq_mhz, fitted_signal, "--", label="multi-site Dulya fit")
-plt.axvline(params["f_lo_mhz"], color="tab:gray", ls=":", alpha=0.7, label="f_lo")
-plt.axvline(params["f_hi_mhz"], color="tab:gray", ls="--", alpha=0.7, label="f_hi")
-plt.axvline(
-    resonance_center_mhz - params["split_cd"],
-    color="tab:blue",
-    ls=":",
-    alpha=0.7,
-    label="C-D peaks",
-)
-plt.axvline(
-    resonance_center_mhz + params["split_cd"],
-    color="tab:blue",
-    ls=":",
-    alpha=0.7,
-)
-plt.axvline(
-    resonance_center_mhz - params["split_od"],
-    color="tab:orange",
-    ls="--",
-    alpha=0.7,
-    label="O-D peaks",
-)
-plt.axvline(
-    resonance_center_mhz + params["split_od"],
-    color="tab:orange",
-    ls="--",
-    alpha=0.7,
-)
-plt.xlabel("Frequency (MHz)")
-plt.ylabel("Voltage (V)")
-plt.title(f"Multi-site Dulya fit (event {INDEX}, χ² = {fit_chi2:.4g})")
-plt.legend()
-plt.grid(True)
+plt.tight_layout()
 plt.show()
