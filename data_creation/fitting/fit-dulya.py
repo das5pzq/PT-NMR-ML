@@ -15,54 +15,39 @@ CENTER_MHZ = 32.68
 EDGE_FRACTION = 0.28  # outer 28% of bins on each side (~32.3–32.52 & 32.88–33.1 MHz)
 POLYNOMIAL_DEGREE = 3
 
-# fit_multisite fit_signal defaults and bounds
-SPLIT_CD0 = 0.09
-SPLIT_OD0 = 0.07
-SIGMA0 = 0.05
-ETA_OD0 = 0.15
-K0 = 0.12
-XI0 = 0.0
-CC0 = 1.0
-
-P_BOUNDS = (-0.99, 0.99)
-SIGMA_BOUNDS = (0.0, 0.5)
-ETA_OD_BOUNDS = (0.0, 0.520)
-K_BOUNDS = (0.0, 0.50)
-XI_BOUNDS = (-0.15, 0.15)
-CC_BOUNDS = (0.0, 1.5)
 
 PARAMS = {
     "P": 0.4,              # deuteron vector polarization
-    "amp": 1.0,            # overall signal amplitude scale
+    "amp": 0.7,            # overall signal amplitude scale
     "center": 0.0,         # frequency axis center shift
     "cc": 0.8,             # x-axis calibration (x_eff = cc * (x - center))
-    "split_cd": 0.92,      # C-D site quadrupole scale 3*w_q
-    "split_od": 0.88,      # O-D site quadrupole scale 3*w_q
-    "sigma": 0.05,         # common dipolar linewidth width
-    "eta_od": 0.05,        # O-D quadrupole asymmetry parameter
-    "K": 0.15,             # O-D site fraction: (1-K)*CD + K*OD
+    "split_cd": 0.8,      # C-D site quadrupole scale 3*w_q
+    "split_od": 0.8,      # O-D site quadrupole scale 3*w_q
+    "sigma": 0.01,         # common dipolar linewidth width
+    "eta_od": 0.01,        # O-D quadrupole asymmetry parameter
+    "K": 0.5,             # O-D site fraction: (1-K)*CD + K*OD
     "xi": 0.0,             # Q-meter false-asymmetry correction
     "b0": 0.0,             # background polynomial constant term
     "b1": 0.0,             # background polynomial linear term
     "b2": 0.0,             # background polynomial quadratic term
     "b3": 0.0,             # background polynomial cubic term
     "wd": 32.68,           # deuteron Larmor frequency (MHz)
-    "eta_cd": 0.00,        # C-D quadrupole asymmetry parameter
+    "eta_cd": 0.01,        # C-D quadrupole asymmetry parameter
     "exact_intensity": True,  # use Dulya Eq. (24) vs weak-quadrupole approx
     "nphi": 64,            # phi steps for powder average
 }
 
 FIT_BOUNDS = {
-    "P": (-0.99, 0.0),
+    "P": (-0.99, -0.1),
     "amp": (-np.inf, np.inf),
     "center": (-1.0, 1.0),
-    "cc": (0.5, 1.5),
-    "split_cd": (1e-4, 1.0),
-    "split_od": (1e-4, 1.0),
+    "cc": (0.0, 2.5),
+    "split_cd": (1e-4, 2.0),
+    "split_od": (1e-4, 2.0),
     "sigma": (0.0, 2.0),
     "eta_od": (0.0, 2.0),
     "eta_cd": (0.0, 0.00),
-    "K": (0.0, 1.0),
+    "K": (0.0, 2.0),
     "xi": (-1.0, 1.0),
     "b0": (-np.inf, np.inf),
     "b1": (0.0, 0.0),
@@ -76,8 +61,8 @@ with open(PATH) as f:
 freq_mhz = np.asarray(records[0]["freq_list"])
 signal_event = np.asarray(records[INDEX][VOLTAGE_KEY])
 
-X_MIN = -5.0
-X_MAX = 5.5
+X_MIN = -6.0
+X_MAX = 6.0
 
 R = np.linspace(X_MIN, X_MAX, len(freq_mhz))
 
