@@ -198,8 +198,8 @@ def DulyaFit(x, P, scaling_factor, eta, phi, g):
         r = r
     else:
         r = 1/r
-        Iplus = -Lineshape(x,1, eta, phi, g)
-        Iminus = -r*Lineshape(x,-1, eta, phi, g)
+        Iplus = -r*Lineshape(x,1, eta, phi, g)
+        Iminus = -Lineshape(x,-1, eta, phi, g)
 
     ### Scaling
     pSummed = np.sum(Iplus + Iminus)
