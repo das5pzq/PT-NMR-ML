@@ -6,7 +6,9 @@ import numpy as np
 from scipy.optimize import curve_fit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from physics.Lineshape import DulyaFit
+from model.dulya import DulyaModel
 
 PATH = "../data/2022-07-21_00-22-36__2022-07-21_11-39-08.txt"
 VOLTAGE_KEY = "basesub" 
@@ -18,12 +20,13 @@ HALF_WIDTH_MHZ = 0.6  # initial guess: f_lo = center - half_width, f_hi = center
 EDGE_FRACTION = 0.28  # outer 28% of bins on each side (~32.3–32.52 & 32.88–33.1 MHz)
 POLYNOMIAL_DEGREE = 3
 
-# DulyaFit parameters: P, scaling_factor, eta, phi, g, half_width_mhz
+# DulyaFit parameters: P, scaling_factor, eta, phi, g, xi, half_width_mhz
 P_BOUNDS = (-0.99, 0.99) # deuteron vector polarization
 SCALING_BOUNDS = (1e-4, 0.05)
 ETA_BOUNDS = (0.001, 0.5) # filling factor of coil
 PHI_BOUNDS = (0.0, 2 * np.pi) # phi angle of N-D bond with magnetic field
 G_BOUNDS = (0.001, 1.0) # common dipolar linewidth width
+XI_BOUNDS = (-1.0, 1.0) # Q-meter false-asymmetry correction
 
 ### Half-width bounds for modeling lineshape (center fixed at CENTER_MHZ) ###
 
@@ -33,8 +36,11 @@ SCALING0 = 0.009
 ETA0 = 0.0104
 PHI0 = 6.1319
 G0 = 0.2
+XI0 = 0.0
 
-PARAM_NAMES = ("P", "scaling_factor", "eta", "phi", "g", "half_width_mhz")
+PARAM_NAMES = ("P", "scaling_factor", "eta", "phi", "g", "xi", "half_width_mhz")
+
+_dulya = DulyaModel()
 
 
 def dulya_model(
@@ -44,11 +50,16 @@ def dulya_model(
     eta: float,
     phi: float,
     g: float,
+    xi: float,
     half_width_mhz: float,
 ) -> np.ndarray:
     half_width = max(half_width_mhz, 1e-6)
-    x = (np.asarray(freq_mhz, dtype=np.float64) - CENTER_MHZ) / half_width
-    return DulyaFit(x, p, scaling_factor, eta, phi, g)
+    freq_mhz = np.asarray(freq_mhz, dtype=np.float64)
+    x_eff = freq_mhz - CENTER_MHZ
+    x = x_eff / half_width
+    signal = DulyaFit(x, p, scaling_factor, eta, phi, g)
+    gain = _dulya.qmeter_gain(x_eff, half_width, xi)
+    return signal * gain
 
 with open(PATH) as f:
     records = [json.loads(line) for line in f]
@@ -115,13 +126,14 @@ plt.show()
 
 # ---- Dulya lineshape fit ----
 
-p0 = (p0_guess, SCALING0, ETA0, PHI0, G0, half_width0)
+p0 = (p0_guess, SCALING0, ETA0, PHI0, G0, XI0, half_width0)
 lower = (
     P_BOUNDS[0],
     SCALING_BOUNDS[0],
     ETA_BOUNDS[0],
     PHI_BOUNDS[0],
     G_BOUNDS[0],
+    XI_BOUNDS[0],
     HALF_WIDTH_BOUNDS[0],
 )
 upper = (
@@ -130,6 +142,7 @@ upper = (
     ETA_BOUNDS[1],
     PHI_BOUNDS[1],
     G_BOUNDS[1],
+    XI_BOUNDS[1],
     HALF_WIDTH_BOUNDS[1],
 )
 
