@@ -190,25 +190,31 @@ def GenerateVectorLineshape(P,x, CC, eta, phi, g):
     return signal,Iplus,Iminus
 
 def DulyaFit(x, P, scaling_factor, eta, phi, g):
+    """Fitsub/basesub Dulya doublet: sign(P) reverses frequency; sum = P * scaling_factor."""
+    x = np.asarray(x, dtype=float)
+    p_signed = float(P)
+    p_mag = abs(p_signed)
+    if p_mag < 1e-4:
+        p_mag = 1e-4
+        p_signed = 1e-4 if p_signed >= 0.0 else -1e-4
+    x_use = x if p_signed >= 0.0 else -x
 
-    r = (np.sqrt(4 - 3 * P ** 2) + P) / (2 - 2 * P)
-    if P > 0:
-        Iplus = r*Lineshape(x,1, eta, phi, g)
-        Iminus = Lineshape(x,-1, eta, phi, g)
-        r = r
-    else:
-        r = 1/r
-        Iplus = -r*Lineshape(x,1, eta, phi, g)
-        Iminus = -Lineshape(x,-1, eta, phi, g)
+    r = (np.sqrt(4.0 - 3.0 * p_mag**2) + p_mag) / (2.0 - 2.0 * p_mag)
+    i_plus = r * Lineshape(x_use, 1, eta, phi, g)
+    i_minus = Lineshape(x_use, -1, eta, phi, g)
 
-    ### Scaling
-    pSummed = np.sum(Iplus + Iminus)
-    deltaP = (P/pSummed)*scaling_factor
-    Iplus = Iplus*deltaP
-    Iminus = Iminus*deltaP
-    signal = Iplus + Iminus
+    p_summed = np.sum(i_plus + i_minus)
+    if p_summed == 0.0:
+        return np.zeros_like(x, dtype=float)
+    delta_p = (p_signed / p_summed) * scaling_factor
+    return (i_plus + i_minus) * delta_p
 
-    return signal
+
+def QmeterGain(x_eff, split_ref, xi):
+    """Q-meter false-asymmetry correction: D = 1 + 0.5 * xi * (1 + x_eff/split_ref)."""
+    x_eff = np.asarray(x_eff, dtype=float)
+    Rq = x_eff / float(split_ref)
+    return 1.0 + 0.5 * float(xi) * (1.0 + Rq)
 
 def SamplingVectorLineshape(P, x, bound, CC, eta, phi, g):
     """Sampling the lineshape with a stochastic shift to frequency bins.

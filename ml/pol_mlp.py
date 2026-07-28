@@ -14,7 +14,7 @@ from lightning.pytorch.core import LightningModule
 import matplotlib.pyplot as plt
 import random
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import pickle
 import json
 import warnings
@@ -39,6 +39,9 @@ def _accelerator():
 
 ACCELERATOR, N_DEVICES = _accelerator()
 
+# Front-end: 1 = first differences (kills DC), 2 = second differences (also kills linear trend)
+DIFF_ORDER = 1
+
 
 class NMRDataset(Dataset):
     def __init__(self, X, y):
@@ -52,12 +55,44 @@ class NMRDataset(Dataset):
         return self.X[idx], self.y[idx]
 
 
-class SimpleFeedForward(nn.Module):
-    """Two fully-connected hidden layers followed by a linear output."""
-    def __init__(self, input_dim, hidden_dim=256):
+class SpectrumFrontEnd(nn.Module):
+    """
+    Differentiable high-pass + per-spectrum normalization.
+
+    This is not classical wing / polynomial baseline fitting: baselines stay in
+    the training data; the network learns on a representation that attenuates
+    slow components and equalizes per-trace scale.
+    """
+
+    def __init__(self, diff_order=1, eps=1e-5):
         super().__init__()
+        if diff_order < 1:
+            raise ValueError("diff_order must be >= 1")
+        self.diff_order = int(diff_order)
+        self.eps = eps
+        # Normalize across the frequency axis for each spectrum independently.
+        self.norm = nn.InstanceNorm1d(1, affine=True, eps=eps)
+
+    def forward(self, x):
+        # x: (batch, 1, length)
+        for _ in range(self.diff_order):
+            x = x[..., 1:] - x[..., :-1]
+        return self.norm(x)
+
+
+class SimpleFeedForward(nn.Module):
+    """Front-end -> two fully-connected hidden layers -> linear output."""
+
+    def __init__(self, input_dim, hidden_dim=256, diff_order=DIFF_ORDER):
+        super().__init__()
+        self.front_end = SpectrumFrontEnd(diff_order=diff_order)
+        feat_dim = input_dim - self.front_end.diff_order
+        if feat_dim < 1:
+            raise ValueError(
+                f"input_dim={input_dim} too small for diff_order={self.front_end.diff_order}"
+            )
         self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+            nn.Linear(feat_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -65,14 +100,16 @@ class SimpleFeedForward(nn.Module):
         )
 
     def forward(self, x):
+        # x: (batch, length) -> front-end expects (batch, 1, length)
+        x = self.front_end(x.unsqueeze(1)).squeeze(1)
         return self.net(x)
 
 
 class FFLightningModule(LightningModule):
-    def __init__(self, input_dim=500, hidden_dim=256, learning_rate=1e-3):
+    def __init__(self, input_dim=512, hidden_dim=256, learning_rate=1e-3, diff_order=DIFF_ORDER):
         super().__init__()
         self.save_hyperparameters()
-        self.model = SimpleFeedForward(input_dim, hidden_dim)
+        self.model = SimpleFeedForward(input_dim, hidden_dim, diff_order=diff_order)
         self.criterion = nn.MSELoss()
         self.learning_rate = learning_rate
 
@@ -140,16 +177,16 @@ class LossHistoryCallback(Callback):
 def train_model(X_train, y_train, X_val, y_val, X_test, y_test,
                 model_dir, performance_dir, version,
                 num_workers=4, learning_rate=1e-3, max_epochs=500,
-                hidden_dim=256):
+                hidden_dim=256, batch_size=256, diff_order=DIFF_ORDER):
 
     pin = torch.cuda.is_available()
-    train_loader = DataLoader(NMRDataset(X_train, y_train), batch_size=256, shuffle=True,
+    train_loader = DataLoader(NMRDataset(X_train, y_train), batch_size=batch_size, shuffle=True,
                               num_workers=num_workers, pin_memory=pin,
                               persistent_workers=True)
-    val_loader   = DataLoader(NMRDataset(X_val,   y_val),   batch_size=256, shuffle=False,
+    val_loader   = DataLoader(NMRDataset(X_val,   y_val),   batch_size=batch_size, shuffle=False,
                               num_workers=num_workers, pin_memory=pin,
                               persistent_workers=True)
-    test_loader  = DataLoader(NMRDataset(X_test,  y_test),  batch_size=256, shuffle=False,
+    test_loader  = DataLoader(NMRDataset(X_test,  y_test),  batch_size=batch_size, shuffle=False,
                               num_workers=num_workers, pin_memory=pin,
                               persistent_workers=True)
 
@@ -160,7 +197,7 @@ def train_model(X_train, y_train, X_val, y_val, X_test, y_test,
         model = FFLightningModule.load_from_checkpoint(checkpoint_path)
     else:
         model = FFLightningModule(input_dim=input_dim, hidden_dim=hidden_dim,
-                                  learning_rate=learning_rate)
+                                  learning_rate=learning_rate, diff_order=diff_order)
 
     checkpoint_cb = ModelCheckpoint(dirpath=model_dir, filename='best_model_checkpoint',
                                     monitor='val_loss', save_top_k=1, mode='min', save_last=True)
@@ -191,15 +228,18 @@ def train_model(X_train, y_train, X_val, y_val, X_test, y_test,
 
 
 if __name__ == "__main__":
-    data_path = "TE_5K.parquet"
-    version = 'TE_MLP_V2'
+    data_path = "data/Training_Data_RGC_1M.parquet"
+    version = 'RGC_MLP_V1'
     performance_dir = f"Model_Performance/{version}"
     model_dir = f"Models/{version}"
     os.makedirs(performance_dir, exist_ok=True)
     os.makedirs(model_dir, exist_ok=True)
 
     df = pd.read_parquet(data_path)
-    signal_cols = df.columns[0:500]
+    n_before = len(df)
+    df = df[(df["P"] <= -0.15) | (df["P"] >= 0.15)].reset_index(drop=True)
+    print(f"Excluded |P| < 0.15: {n_before} -> {len(df)} samples")
+    signal_cols = df.columns[0:512]
 
     scaler = MinMaxScaler()
     scaler_path = f"{performance_dir}/{version}_scaler.pkl"
@@ -236,24 +276,27 @@ if __name__ == "__main__":
 
     num_workers  = 13
     learning_rate = 3e-4
-    max_epochs   = 500
+    max_epochs   = 1000
     hidden_dim   = 32
+    batch_size   = 32
 
     print("\n" + "=" * 60)
     print("Training MLP Model")
+    print(f"Front-end: diff_order={DIFF_ORDER}, InstanceNorm")
     print("=" * 60)
 
     model, trainer = train_model(
         X_train, y_train, X_val, y_val, X_test, y_test,
         model_dir, performance_dir, version,
         num_workers, learning_rate, max_epochs, hidden_dim,
+        batch_size, DIFF_ORDER,
     )
 
     print("\n" + "=" * 60)
     print("Evaluating on Test Set")
     print("=" * 60)
 
-    test_loader = DataLoader(NMRDataset(X_test, y_test), batch_size=256, shuffle=False,
+    test_loader = DataLoader(NMRDataset(X_test, y_test), batch_size=batch_size, shuffle=False,
                              num_workers=num_workers, pin_memory=torch.cuda.is_available(),
                              persistent_workers=num_workers > 0)
 
@@ -340,6 +383,22 @@ if __name__ == "__main__":
         plt.tight_layout()
         plt.savefig(f"{performance_dir}/{version}_loss.png", dpi=600)
         plt.close()
+
+    # Save a one-sample front-end preview for sanity checking
+    with torch.no_grad():
+        x0 = torch.from_numpy(X_test[:1])
+        z0 = model.model.front_end(x0.unsqueeze(1)).squeeze().cpu().numpy()
+    fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=False)
+    axes[0].plot(X_test[0], lw=1.0)
+    axes[0].set_title(f"Input spectrum (baseline included)  P={y_test[0, 0]:.4f}")
+    axes[0].set_ylabel("Signal")
+    axes[1].plot(z0, lw=1.0, color="#b22222")
+    axes[1].set_title("After SpectrumFrontEnd (diff + InstanceNorm)")
+    axes[1].set_xlabel("Bin")
+    axes[1].set_ylabel("Front-end out")
+    fig.tight_layout()
+    fig.savefig(f"{performance_dir}/{version}_frontend_preview.png", dpi=200)
+    plt.close()
 
     print("\n" + "=" * 60)
     print("Done!")
