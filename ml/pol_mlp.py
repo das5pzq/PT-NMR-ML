@@ -29,6 +29,7 @@ random.seed(42)
 np.random.seed(42)
 torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
+torch.set_float32_matmul_precision('medium' | 'high')
 
 def _accelerator():
     if torch.cuda.is_available():
@@ -41,17 +42,22 @@ ACCELERATOR, N_DEVICES = _accelerator()
 
 # Front-end: 1 = first differences (kills DC), 2 = second differences (also kills linear trend)
 DIFF_ORDER = 1
+# When True, concatenate the per-event cc calibration factor as an extra MLP input.
+USE_CC = True
 
 
 class NMRDataset(Dataset):
-    def __init__(self, X, y):
+    def __init__(self, X, y, cc=None):
         self.X = torch.FloatTensor(X)
         self.y = torch.FloatTensor(y)
+        self.cc = None if cc is None else torch.FloatTensor(cc).reshape(-1, 1)
 
     def __len__(self):
         return len(self.X)
 
     def __getitem__(self, idx):
+        if self.cc is not None:
+            return self.X[idx], self.cc[idx], self.y[idx]
         return self.X[idx], self.y[idx]
 
 
@@ -83,14 +89,17 @@ class SpectrumFrontEnd(nn.Module):
 class SimpleFeedForward(nn.Module):
     """Front-end -> two fully-connected hidden layers -> linear output."""
 
-    def __init__(self, input_dim, hidden_dim=256, diff_order=DIFF_ORDER):
+    def __init__(self, input_dim, hidden_dim=256, diff_order=DIFF_ORDER, use_cc=USE_CC):
         super().__init__()
-        self.front_end = SpectrumFrontEnd(diff_order=diff_order)
+        self.use_cc = bool(use_cc)
+        # self.front_end = SpectrumFrontEnd(diff_order=diff_order)
         feat_dim = input_dim - self.front_end.diff_order
         if feat_dim < 1:
             raise ValueError(
                 f"input_dim={input_dim} too small for diff_order={self.front_end.diff_order}"
             )
+        if self.use_cc:
+            feat_dim += 1
         self.net = nn.Sequential(
             nn.Linear(feat_dim, hidden_dim),
             nn.ReLU(),
@@ -99,40 +108,61 @@ class SimpleFeedForward(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, x):
+    def forward(self, x, cc=None):
         # x: (batch, length) -> front-end expects (batch, 1, length)
-        x = self.front_end(x.unsqueeze(1)).squeeze(1)
+        # x = self.front_end(x.unsqueeze(1)).squeeze(1)
+        if self.use_cc:
+            if cc is None:
+                raise ValueError("use_cc=True but cc was not provided")
+            x = torch.cat([x, cc], dim=1)
         return self.net(x)
 
 
 class FFLightningModule(LightningModule):
-    def __init__(self, input_dim=512, hidden_dim=256, learning_rate=1e-3, diff_order=DIFF_ORDER):
+    def __init__(
+        self,
+        input_dim=512,
+        hidden_dim=256,
+        learning_rate=1e-3,
+        diff_order=DIFF_ORDER,
+        use_cc=USE_CC,
+    ):
         super().__init__()
         self.save_hyperparameters()
-        self.model = SimpleFeedForward(input_dim, hidden_dim, diff_order=diff_order)
+        self.model = SimpleFeedForward(
+            input_dim, hidden_dim, diff_order=diff_order, use_cc=use_cc
+        )
         self.criterion = nn.MSELoss()
         self.learning_rate = learning_rate
+        self.use_cc = bool(use_cc)
 
-    def forward(self, x):
-        return self.model(x)
+    def forward(self, x, cc=None):
+        return self.model(x, cc=cc)
+
+    def _unpack_batch(self, batch):
+        if self.use_cc:
+            x, cc, y = batch
+            return x, cc, y
+        x, y = batch
+        return x, None, y
 
     def training_step(self, batch, batch_idx):
-        x, y = batch
-        y_hat = self(x)
+        x, cc, y = self._unpack_batch(batch)
+        y_hat = self(x, cc=cc)
         loss = self.criterion(y_hat, y)
         self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log('train_mae', F.l1_loss(y_hat, y), on_step=False, on_epoch=True, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        x, y = batch
-        y_hat = self(x)
+        x, cc, y = self._unpack_batch(batch)
+        y_hat = self(x, cc=cc)
         self.log('val_loss', self.criterion(y_hat, y), on_step=False, on_epoch=True, prog_bar=True)
         self.log('val_mae', F.l1_loss(y_hat, y), on_step=False, on_epoch=True, prog_bar=True)
 
     def test_step(self, batch, batch_idx):
-        x, y = batch
-        y_hat = self(x)
+        x, cc, y = self._unpack_batch(batch)
+        y_hat = self(x, cc=cc)
         self.log('test_loss', self.criterion(y_hat, y), on_step=False, on_epoch=True, prog_bar=True)
         self.log('test_mae', F.l1_loss(y_hat, y), on_step=False, on_epoch=True, prog_bar=True)
 
@@ -177,18 +207,31 @@ class LossHistoryCallback(Callback):
 def train_model(X_train, y_train, X_val, y_val, X_test, y_test,
                 model_dir, performance_dir, version,
                 num_workers=4, learning_rate=1e-3, max_epochs=500,
-                hidden_dim=256, batch_size=256, diff_order=DIFF_ORDER):
+                hidden_dim=256, batch_size=256, diff_order=DIFF_ORDER,
+                use_cc=USE_CC, cc_train=None, cc_val=None, cc_test=None):
 
     pin = torch.cuda.is_available()
-    train_loader = DataLoader(NMRDataset(X_train, y_train), batch_size=batch_size, shuffle=True,
-                              num_workers=num_workers, pin_memory=pin,
-                              persistent_workers=True)
-    val_loader   = DataLoader(NMRDataset(X_val,   y_val),   batch_size=batch_size, shuffle=False,
-                              num_workers=num_workers, pin_memory=pin,
-                              persistent_workers=True)
-    test_loader  = DataLoader(NMRDataset(X_test,  y_test),  batch_size=batch_size, shuffle=False,
-                              num_workers=num_workers, pin_memory=pin,
-                              persistent_workers=True)
+    if use_cc and (cc_train is None or cc_val is None or cc_test is None):
+        raise ValueError("use_cc=True requires cc_train, cc_val, and cc_test")
+
+    train_loader = DataLoader(
+        NMRDataset(X_train, y_train, cc=cc_train if use_cc else None),
+        batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=pin,
+        persistent_workers=num_workers > 0,
+    )
+    val_loader = DataLoader(
+        NMRDataset(X_val, y_val, cc=cc_val if use_cc else None),
+        batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=pin,
+        persistent_workers=num_workers > 0,
+    )
+    test_loader = DataLoader(
+        NMRDataset(X_test, y_test, cc=cc_test if use_cc else None),
+        batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=pin,
+        persistent_workers=num_workers > 0,
+    )
 
     input_dim = X_train.shape[1]
     checkpoint_path = f"{model_dir}/best_model_checkpoint.ckpt"
@@ -196,8 +239,13 @@ def train_model(X_train, y_train, X_val, y_val, X_test, y_test,
         print(f"Resuming from {checkpoint_path}")
         model = FFLightningModule.load_from_checkpoint(checkpoint_path)
     else:
-        model = FFLightningModule(input_dim=input_dim, hidden_dim=hidden_dim,
-                                  learning_rate=learning_rate, diff_order=diff_order)
+        model = FFLightningModule(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            learning_rate=learning_rate,
+            diff_order=diff_order,
+            use_cc=use_cc,
+        )
 
     checkpoint_cb = ModelCheckpoint(dirpath=model_dir, filename='best_model_checkpoint',
                                     monitor='val_loss', save_top_k=1, mode='min', save_last=True)
@@ -267,6 +315,19 @@ if __name__ == "__main__":
     y_test = df_test["P"].values.astype('float32').reshape(-1, 1)
     test_SNR = df_test["SNR"].values.astype('float32')
 
+    cc_train = cc_val = cc_test = None
+    cc_scaler = None
+    if USE_CC:
+        if "cc" not in df_train.columns:
+            raise ValueError("USE_CC=True but parquet has no 'cc' column")
+        cc_scaler = StandardScaler()
+        cc_train = cc_scaler.fit_transform(df_train["cc"].values.astype('float32').reshape(-1, 1))
+        cc_val = cc_scaler.transform(df_val["cc"].values.astype('float32').reshape(-1, 1))
+        cc_test = cc_scaler.transform(df_test["cc"].values.astype('float32').reshape(-1, 1))
+        cc_scaler_path = f"{performance_dir}/{version}_cc_scaler.pkl"
+        with open(cc_scaler_path, 'wb') as f:
+            pickle.dump(cc_scaler, f)
+
     print(f"Number of training data points: {len(df_train)}")
 
     del df_train, df_val, df_test
@@ -282,14 +343,14 @@ if __name__ == "__main__":
 
     print("\n" + "=" * 60)
     print("Training MLP Model")
-    print(f"Front-end: diff_order={DIFF_ORDER}, InstanceNorm")
+    print(f"Front-end: diff_order={DIFF_ORDER}, InstanceNorm, use_cc={USE_CC}")
     print("=" * 60)
 
     model, trainer = train_model(
         X_train, y_train, X_val, y_val, X_test, y_test,
         model_dir, performance_dir, version,
         num_workers, learning_rate, max_epochs, hidden_dim,
-        batch_size, DIFF_ORDER,
+        batch_size, DIFF_ORDER, USE_CC, cc_train, cc_val, cc_test,
     )
 
     print("\n" + "=" * 60)
@@ -303,8 +364,13 @@ if __name__ == "__main__":
     model.eval()
     predictions = []
     with torch.no_grad():
-        for x, _ in test_loader:
-            predictions.append(model(x).cpu().numpy())
+        for batch in test_loader:
+            if USE_CC:
+                x, cc, _ = batch
+                predictions.append(model(x, cc=cc).cpu().numpy())
+            else:
+                x, _ = batch
+                predictions.append(model(x).cpu().numpy())
 
     y_pred = np.concatenate(predictions, axis=0)
     y_test_flat = y_test.flatten() * 100.0
@@ -369,6 +435,8 @@ if __name__ == "__main__":
             'MSE': float(mse), 'MAE': float(mae), 'RMSE': float(rmse),
             'Mean_RPE': float(rpe.mean()), 'Std_RPE': float(rpe.std()),
             'Mean_RPE_95th': float(rpe_95.mean()), 'Std_RPE_95th': float(rpe_95.std()),
+            'use_cc': USE_CC,
+            'diff_order': DIFF_ORDER,
         }, f, indent=4)
 
     loss_csv = f"{performance_dir}/{version}_loss.csv"
