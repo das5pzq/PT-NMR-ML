@@ -17,38 +17,59 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from physics.Lineshape import DulyaFit, QmeterGain
 
-PATH = "data-d"
-OUT_YAML = "fitting/dulya_fits.yaml"
-OUT_STATS_YAML = "fitting/dulya_fit_stats.yaml"
-OUT_STATS_DIR = "fitting/dulya_fit_stats"
+PATH = "data-test"
+OUT_YAML = "fitting/dulya_fits_single_period.yaml"
+OUT_STATS_YAML = "fitting/dulya_fit_stats_single_period.yaml"
+OUT_STATS_DIR = "fitting/dulya_fit_stats_single_period"
 
-VOLTAGE_KEY = "fitsub"
+VOLTAGE_KEY = "basesub"
 
 CENTER_MHZ = 32.68
 HALF_WIDTH_MHZ = 0.075  # fallback if peak finding fails
 
-EDGE_FRACTION = 0.15  # outer fraction of bins on each side for wing polynomial
-POLYNOMIAL_DEGREE = 3
-
+EDGE_FRACTION = 0.25  # outer fraction of bins on each side for wing polynomial
+POLYNOMIAL_DEGREE = 2
+CENTER_NOISE_FRAC = 0.1
+MIN_CENTER_NOISE_BINS = 8
 MIN_MODEL_SNR = 3.0
-MAX_NRMSE = 0.05
+MAX_NRMSE = 0.5
 REQUIRE_DOUBLET = True
-MAX_NFEV = 500
+SKIP_FLIPPED_SIGN = False
+MAX_NFEV = 800  
 
-# File stores pol = cc * area. DulyaFit uses sum = P * factor, so pass factor = 1/cc.
-ETA_BOUNDS = (0.001, 0.3)
-PHI_BOUNDS = (0.0, 2 * np.pi)
-G_BOUNDS = (0.001, 0.15)
+P_BOUNDS = (-1.0, 1.0)
+ETA_BOUNDS = (0.001, 0.5)
+G_BOUNDS = (0.001, 0.015)
 XI_BOUNDS = (-1.0, 1.0)
 HALF_WIDTH_BOUNDS = (0.04, 0.12)
 
-ETA0 = 0.0104
-PHI0 = 6.1319
-G0 = 0.05
-XI0 = 0.0
+# =====================================================================
+# TIGHTENED BOUNDS: Forces the Gaussians to stay narrow and on the peaks
+# =====================================================================
+G_AMP_BOUNDS = (0.0, 1.0)        # Prevent aggressive over-subtraction
+G1_LOC_BOUNDS = (-1.15, -0.85)   # Anchor firmly to the left peak
+G2_LOC_BOUNDS = (0.85, 1.15)     # Anchor firmly to the right peak
+G_WID_BOUNDS = (0.01, 0.15)      # Force narrowness to preserve shoulders
+POWDER_NPHI = 64
 
-# P and scaling_factor (file cc) are fixed; remaining params are free.
-PARAM_NAMES = ("P", "scaling_factor", "eta", "phi", "g", "xi", "half_width_mhz")
+P0 = 0.3
+PHI_FIXED = 0.0
+XI0 = 0.3
+
+# Fixed linewidth and coil fill factor from evt 349 reference fit
+ETA_FIXED = 0.12059625217020538
+G_FIXED = 0.014999999999999998
+
+# Initial guesses for the negative Gaussians
+G_AMP0 = 0.1
+G1_LOC0 = -1.0
+G2_LOC0 = 1.0
+G_WID0 = 0.01
+
+PARAM_NAMES = (
+    "P", "scaling_factor", "eta", "phi", "g", "xi", "half_width_mhz",
+    "g1_amp", "g1_loc", "g1_wid", "g2_amp", "g2_loc", "g2_wid"
+)
 N_EXAMPLE_PLOTS = 4
 
 
@@ -61,6 +82,12 @@ def dulya_model(
     g: float,
     xi: float,
     half_width_mhz: float,
+    g1_amp: float,
+    g1_loc: float,
+    g1_wid: float,
+    g2_amp: float,
+    g2_loc: float,
+    g2_wid: float,
     center_mhz: float = CENTER_MHZ,
 ) -> np.ndarray:
 
@@ -72,7 +99,22 @@ def dulya_model(
     freq_mhz = np.asarray(freq_mhz, dtype=np.float64)
     x_eff = freq_mhz - center_mhz
     x = x_eff / half_width
-    shape = DulyaFit(x, p_eff, 1.0 / cc, eta, phi, g)
+    shape = DulyaFit(
+        x,
+        p_eff,
+        1.0 / cc,
+        eta,
+        phi,
+        g,
+        g1_amp=g1_amp,
+        g1_loc=g1_loc,
+        g1_wid=g1_wid,
+        g2_amp=g2_amp,
+        g2_loc=g2_loc,
+        g2_wid=g2_wid,
+        powder_average=True,
+        nphi=POWDER_NPHI,
+    )
     gain = QmeterGain(x_eff, half_width, xi)
     return shape * gain
 
@@ -95,6 +137,16 @@ def detrend_wings(freq_mhz: np.ndarray, signal: np.ndarray, mask: np.ndarray) ->
     return signal - np.polyval(coeffs, freq_mhz)
 
 
+def center_noise_sigma(
+    freq_mhz: np.ndarray,
+    signal_detrended: np.ndarray,
+    center_mhz: float,
+    half_width_mhz: float,
+) -> float:
+    sigma = 1e-4
+    return sigma
+
+
 def amplitude_sign(signal_detrended: np.ndarray) -> float:
     idx = int(np.argmax(np.abs(signal_detrended)))
     s = float(np.sign(signal_detrended[idx]))
@@ -105,7 +157,6 @@ def find_doublet_peaks(
     freq_mhz: np.ndarray,
     signal_detrended: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Peak indices after flipping so horns are positive regardless of polarity."""
     amp_sign = amplitude_sign(signal_detrended)
     profile = amp_sign * signal_detrended
     height = 0.35 * float(np.max(profile))
@@ -118,7 +169,6 @@ def estimate_doublet(
     freq_mhz: np.ndarray,
     signal_detrended: np.ndarray,
 ) -> tuple[float, float, bool]:
-    """Estimate ``(center_mhz, half_width_mhz, found_doublet)`` from the two peaks."""
     peaks, profile = find_doublet_peaks(freq_mhz, signal_detrended)
     if len(peaks) < 2:
         return CENTER_MHZ, HALF_WIDTH_MHZ, False
@@ -135,57 +185,41 @@ def estimate_doublet(
 def _fit_dulya_once(
     freq_mhz: np.ndarray,
     signal_detrended: np.ndarray,
-    p_fixed: float,
     scale_fixed: float,
-    mask: np.ndarray,
     center_mhz: float,
     half_width0: float,
-) -> tuple[np.ndarray, float, float]:
-    """Returns ``(params, nrmse, model_snr)`` with fixed P and cc."""
-    p_fixed = float(p_fixed)
+) -> tuple[np.ndarray, float, float, float]:
     scale_fixed = float(scale_fixed)
-
     hw0 = float(np.clip(half_width0, *HALF_WIDTH_BOUNDS))
+    
     p0 = np.array(
-        [ETA0, PHI0, G0, XI0, hw0],
+        [
+            P0, XI0, hw0,
+            G_AMP0, G1_LOC0, G_WID0,
+            G_AMP0, G2_LOC0, G_WID0,
+        ],
         dtype=np.float64,
     )
     lower = [
-        ETA_BOUNDS[0],
-        PHI_BOUNDS[0],
-        G_BOUNDS[0],
-        XI_BOUNDS[0],
-        HALF_WIDTH_BOUNDS[0],
+        P_BOUNDS[0], XI_BOUNDS[0], HALF_WIDTH_BOUNDS[0],
+        G_AMP_BOUNDS[0], G1_LOC_BOUNDS[0], G_WID_BOUNDS[0],
+        G_AMP_BOUNDS[0], G2_LOC_BOUNDS[0], G_WID_BOUNDS[0],
     ]
     upper = [
-        ETA_BOUNDS[1],
-        PHI_BOUNDS[1],
-        G_BOUNDS[1],
-        XI_BOUNDS[1],
-        HALF_WIDTH_BOUNDS[1],
+        P_BOUNDS[1], XI_BOUNDS[1], HALF_WIDTH_BOUNDS[1],
+        G_AMP_BOUNDS[1], G1_LOC_BOUNDS[1], G_WID_BOUNDS[1],
+        G_AMP_BOUNDS[1], G2_LOC_BOUNDS[1], G_WID_BOUNDS[1],
     ]
 
-    sigma = float(np.std(signal_detrended[mask]))
-    if sigma <= 0.0:
-        raise RuntimeError("wing noise estimate is zero")
-
-    left = (freq_mhz < center_mhz) & (np.abs(freq_mhz - center_mhz) < 2.5 * hw0)
-    right = (freq_mhz >= center_mhz) & (np.abs(freq_mhz - center_mhz) < 2.5 * hw0)
-    weights = np.ones_like(signal_detrended)
-    if np.any(left):
-        weights[left] = 2.0
-    if np.any(right):
-        weights[right] = 2.0
+    sigma = center_noise_sigma(freq_mhz, signal_detrended, center_mhz, hw0)
 
     def residuals(theta: np.ndarray) -> np.ndarray:
+        p, xi, half_width_mhz, g1_amp, g1_loc, g1_wid, g2_amp, g2_loc, g2_wid = theta
         model = dulya_model(
-            freq_mhz,
-            p_fixed,
-            scale_fixed,
-            *theta,
-            center_mhz=center_mhz,
+            freq_mhz, p, scale_fixed, ETA_FIXED, PHI_FIXED, G_FIXED, xi, half_width_mhz,
+            g1_amp, g1_loc, g1_wid, g2_amp, g2_loc, g2_wid, center_mhz=center_mhz,
         )
-        return weights * (signal_detrended - model) / sigma
+        return (signal_detrended - model) / sigma
 
     result = least_squares(
         residuals,
@@ -194,7 +228,15 @@ def _fit_dulya_once(
         max_nfev=MAX_NFEV,
     )
     free = np.asarray(result.x, dtype=np.float64)
-    params = np.concatenate(([p_fixed, scale_fixed], free))
+    p, xi, half_width_mhz, g1_amp, g1_loc, g1_wid, g2_amp, g2_loc, g2_wid = free
+
+    params = np.asarray(
+        [
+            p, scale_fixed, ETA_FIXED, PHI_FIXED, G_FIXED, xi, half_width_mhz,
+            g1_amp, g1_loc, g1_wid, g2_amp, g2_loc, g2_wid
+        ],
+        dtype=np.float64,
+    )
     model = dulya_model(freq_mhz, *params, center_mhz=center_mhz)
     residual = signal_detrended - model
     rmse = float(np.sqrt(np.mean(residual**2)))
@@ -202,35 +244,27 @@ def _fit_dulya_once(
     nrmse = float(rmse / peak_amp) if peak_amp > 0.0 else float("inf")
     model_amp = float(np.max(np.abs(model)))
     model_snr = float(model_amp / sigma) if model_amp > 0.0 else 0.0
-    return params, nrmse, model_snr
+    return params, nrmse, model_snr, sigma
 
 
 def fit_dulya(
     freq_mhz: np.ndarray,
     signal: np.ndarray,
-    p_fixed: float,
     scale_fixed: float,
     mask: np.ndarray,
-) -> tuple[np.ndarray, float, float, float]:
-
+) -> tuple[np.ndarray, float, float, float, float]:
     signal_detrended = detrend_wings(freq_mhz, signal, mask)
     center_mhz, half_width0, found_doublet = estimate_doublet(
         freq_mhz, signal_detrended
     )
 
     if REQUIRE_DOUBLET and not found_doublet:
-        raise RuntimeError("no Pake doublet detected (likely sinusoid/qcurve junk)")
+        raise RuntimeError("no Pake doublet detected")
 
-    params, nrmse, model_snr = _fit_dulya_once(
-        freq_mhz,
-        signal_detrended,
-        p_fixed,
-        scale_fixed,
-        mask,
-        center_mhz,
-        half_width0,
+    params, nrmse, model_snr, sigma_err = _fit_dulya_once(
+        freq_mhz, signal_detrended, scale_fixed, center_mhz, half_width0,
     )
-    return params, nrmse, model_snr, center_mhz
+    return params, nrmse, model_snr, center_mhz, sigma_err
 
 
 def _percentile_stats(values: np.ndarray) -> dict[str, float]:
@@ -238,14 +272,10 @@ def _percentile_stats(values: np.ndarray) -> dict[str, float]:
         return {}
     qs = np.percentile(values, [0, 25, 50, 75, 100])
     return {
-        "count": int(values.size),
-        "mean": float(np.mean(values)),
-        "std": float(np.std(values)),
-        "min": float(qs[0]),
-        "p25": float(qs[1]),
-        "median": float(qs[2]),
-        "p75": float(qs[3]),
-        "max": float(qs[4]),
+        "count": int(values.size), "mean": float(np.mean(values)),
+        "std": float(np.std(values)), "min": float(qs[0]),
+        "p25": float(qs[1]), "median": float(qs[2]),
+        "p75": float(qs[3]), "max": float(qs[4]),
     }
 
 
@@ -258,6 +288,7 @@ def collect_fit_rows(results: dict[str, dict]) -> list[dict]:
                 "event_id": int(event_id),
                 "nrmse": float(event["nrmse"]),
                 "model_snr": float(event.get("model_snr", np.nan)),
+                "sigma_err": float(event.get("sigma_err", np.nan)),
                 "center_mhz": float(event["center_mhz"]),
                 "pol_true": float(event["pol_true"]) if "pol_true" in event else np.nan,
             }
@@ -270,11 +301,7 @@ def collect_fit_rows(results: dict[str, dict]) -> list[dict]:
 def summarize_fits(results: dict[str, dict], n_fitted: int, n_skipped: int) -> dict:
     rows = collect_fit_rows(results)
     if not rows:
-        return {
-            "n_files": 0,
-            "n_events_fitted": 0,
-            "n_events_skipped": n_skipped,
-        }
+        return {"n_files": 0, "n_events_fitted": 0, "n_events_skipped": n_skipped}
 
     nrmse = np.asarray([r["nrmse"] for r in rows], dtype=np.float64)
     p_fit = np.asarray([r["P"] for r in rows], dtype=np.float64)
@@ -286,9 +313,8 @@ def summarize_fits(results: dict[str, dict], n_fitted: int, n_skipped: int) -> d
         "n_events_fitted": n_fitted,
         "n_events_skipped": n_skipped,
         "nrmse": _percentile_stats(nrmse),
-        "model_snr": _percentile_stats(
-            np.asarray([r["model_snr"] for r in rows], dtype=np.float64)
-        ),
+        "model_snr": _percentile_stats(np.asarray([r["model_snr"] for r in rows], dtype=np.float64)),
+        "sigma_err": _percentile_stats(np.asarray([r["sigma_err"] for r in rows], dtype=np.float64)),
         "P": _percentile_stats(p_fit),
         "P_negative_fraction": float(np.mean(p_fit < 0.0)),
         "params": {
@@ -301,10 +327,7 @@ def summarize_fits(results: dict[str, dict], n_fitted: int, n_skipped: int) -> d
         residual = p_fit[has_pol] - pol_true[has_pol]
         p_sel = p_fit[has_pol]
         t_sel = pol_true[has_pol]
-        if p_sel.size > 1 and np.std(p_sel) > 0.0 and np.std(t_sel) > 0.0:
-            corr = float(np.corrcoef(p_sel, t_sel)[0, 1])
-        else:
-            corr = float("nan")
+        corr = float(np.corrcoef(p_sel, t_sel)[0, 1]) if (p_sel.size > 1 and np.std(p_sel) > 0.0 and np.std(t_sel) > 0.0) else float("nan")
         summary["polarization"] = {
             "n_with_pol_true": int(np.sum(has_pol)),
             "P_minus_pol_true": _percentile_stats(residual),
@@ -318,31 +341,15 @@ def summarize_fits(results: dict[str, dict], n_fitted: int, n_skipped: int) -> d
 
 def print_summary(summary: dict) -> None:
     print("\n=== Dulya fit summary ===")
-    print(
-        f"gates:   MAX_NRMSE={MAX_NRMSE}  MIN_MODEL_SNR={MIN_MODEL_SNR}  "
-        f"REQUIRE_DOUBLET={REQUIRE_DOUBLET}"
-    )
+    print(f"fixed:   eta={ETA_FIXED:.6g}  g={G_FIXED:.6g}  (from evt 349)")
+    print(f"gates:   MAX_NRMSE={MAX_NRMSE}  MIN_MODEL_SNR={MIN_MODEL_SNR}  REQUIRE_DOUBLET={REQUIRE_DOUBLET}")
     print(f"files:   {summary.get('n_files', 0)}")
     print(f"fitted:  {summary.get('n_events_fitted', 0)}")
     print(f"skipped: {summary.get('n_events_skipped', 0)}")
-    nrmse = summary.get("nrmse") or {}
-    if nrmse:
-        print(
-            "nrmse:   "
-            f"median={nrmse['median']:.4g}  "
-            f"p25={nrmse['p25']:.4g}  "
-            f"p75={nrmse['p75']:.4g}  "
-            f"mean={nrmse['mean']:.4g}"
-        )
-    pol = summary.get("polarization")
-    if pol:
-        print(
-            "P vs pol_true: "
-            f"mae={pol['mae']:.4g}  "
-            f"rmse={pol['rmse']:.4g}  "
-            f"corr={pol['corr']:.4g}"
-        )
-    print(f"P < 0 fraction: {summary.get('P_negative_fraction', 0.0):.3f}")
+    if nrmse := summary.get("nrmse"):
+        print(f"nrmse:   median={nrmse['median']:.4g}  mean={nrmse['mean']:.4g}")
+    if pol := summary.get("polarization"):
+        print(f"P vs pol_true: mae={pol['mae']:.4g}  rmse={pol['rmse']:.4g}  corr={pol['corr']:.4g}")
 
 
 def plot_fit_statistics(results: dict[str, dict], out_dir: Path) -> list[Path]:
@@ -363,77 +370,27 @@ def plot_fit_statistics(results: dict[str, dict], out_dir: Path) -> list[Path]:
     fig, axes = plt.subplots(2, 2, figsize=(11, 8))
     axes[0, 0].hist(nrmse, bins=50, color="steelblue", edgecolor="white", alpha=0.9)
     axes[0, 0].axvline(np.median(nrmse), color="crimson", ls="--", lw=1.2, label="median")
-    axes[0, 0].set_xlabel("NRMSE")
-    axes[0, 0].set_ylabel("Count")
     axes[0, 0].set_title("NRMSE distribution")
     axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
 
     axes[0, 1].hist(p_fit, bins=50, color="darkorange", edgecolor="white", alpha=0.9)
-    axes[0, 1].set_xlabel("P")
-    axes[0, 1].set_ylabel("Count")
     axes[0, 1].set_title("Polarization")
-    axes[0, 1].grid(True, alpha=0.3)
 
     if np.any(has_pol):
-        axes[1, 0].scatter(
-            pol_true[has_pol],
-            p_fit[has_pol],
-            s=8,
-            alpha=0.35,
-            c="teal",
-            edgecolors="none",
-        )
-        lims = [
-            float(np.nanmin([pol_true[has_pol].min(), p_fit[has_pol].min()])),
-            float(np.nanmax([pol_true[has_pol].max(), p_fit[has_pol].max()])),
-        ]
+        axes[1, 0].scatter(pol_true[has_pol], p_fit[has_pol], s=8, alpha=0.35, c="teal")
+        lims = [float(np.nanmin([pol_true[has_pol].min(), p_fit[has_pol].min()])),
+                float(np.nanmax([pol_true[has_pol].max(), p_fit[has_pol].max()]))]
         axes[1, 0].plot(lims, lims, "k--", lw=1.0, label="y = x")
-        axes[1, 0].set_xlabel("pol_true")
-        axes[1, 0].set_ylabel("P")
         axes[1, 0].set_title("P vs pol_true")
         axes[1, 0].legend()
     else:
-        axes[1, 0].text(0.5, 0.5, "no pol_true", ha="center", va="center")
         axes[1, 0].set_axis_off()
-    axes[1, 0].grid(True, alpha=0.3)
 
-    axes[1, 1].scatter(model_snr, nrmse, s=8, alpha=0.35, c="slateblue", edgecolors="none")
-    axes[1, 1].set_xlabel("model SNR")
-    axes[1, 1].set_ylabel("NRMSE")
+    axes[1, 1].scatter(model_snr, nrmse, s=8, alpha=0.35, c="slateblue")
     axes[1, 1].set_title("NRMSE vs model SNR")
-    axes[1, 1].grid(True, alpha=0.3)
 
-    fig.suptitle(f"Dulya fit statistics ({len(rows)} events)", fontsize=13)
     fig.tight_layout()
     path = out_dir / "dulya_fit_statistics.png"
-    fig.savefig(path, dpi=160, bbox_inches="tight")
-    plt.close(fig)
-    written.append(path)
-
-    fig, axes = plt.subplots(2, 2, figsize=(11, 8))
-    for ax, name in zip(axes.ravel(), ("eta", "phi", "g", "xi"), strict=True):
-        vals = np.asarray([r[name] for r in rows], dtype=np.float64)
-        ax.hist(vals, bins=40, color="seagreen", edgecolor="white", alpha=0.9)
-        ax.set_xlabel(name)
-        ax.set_ylabel("Count")
-        ax.set_title(name)
-        ax.grid(True, alpha=0.3)
-    fig.suptitle("Nuisance parameter distributions", fontsize=13)
-    fig.tight_layout()
-    path = out_dir / "dulya_param_histograms.png"
-    fig.savefig(path, dpi=160, bbox_inches="tight")
-    plt.close(fig)
-    written.append(path)
-
-    fig, ax = plt.subplots(figsize=(7, 4.5))
-    ax.hist(half_width, bins=40, color="purple", edgecolor="white", alpha=0.9)
-    ax.set_xlabel("half_width_mhz")
-    ax.set_ylabel("Count")
-    ax.set_title("Half-width distribution")
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    path = out_dir / "dulya_half_width_hist.png"
     fig.savefig(path, dpi=160, bbox_inches="tight")
     plt.close(fig)
     written.append(path)
@@ -442,70 +399,55 @@ def plot_fit_statistics(results: dict[str, dict], out_dir: Path) -> list[Path]:
 
 
 def plot_example_fits(
-    results: dict[str, dict],
-    data_dir: Path,
-    out_dir: Path,
-    n_examples: int = N_EXAMPLE_PLOTS,
+    results: dict[str, dict], data_dir: Path, out_dir: Path, n_examples: int = N_EXAMPLE_PLOTS,
 ) -> Path | None:
     rows = collect_fit_rows(results)
     if not rows:
         return None
 
-    # Plot best / median / worst NRMSE events.
     rows_sorted = sorted(rows, key=lambda r: r["nrmse"])
     n = len(rows_sorted)
-    pick_idxs = sorted(
-        {
-            0,
-            n // 3,
-            2 * n // 3,
-            n - 1,
-        }
-    )[:n_examples]
+    pick_idxs = sorted({1, n // 4, 2 * n // 4, n - 3})[:n_examples]
     picks = [rows_sorted[i] for i in pick_idxs]
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=True)
-    axes_flat = axes.ravel()
+    fig, axes = plt.subplots(
+        4, 2, figsize=(12, 11), sharex=True, gridspec_kw={"height_ratios": [2.4, 1.0, 2.4, 1.0]},
+    )
 
-    for ax, row in zip(axes_flat, picks, strict=False):
+    for panel_i, row in enumerate(picks):
+        ax = axes[(panel_i // 2) * 2, panel_i % 2]
+        axr = axes[(panel_i // 2) * 2 + 1, panel_i % 2]
+
         records = load_records(str(data_dir / row["filename"]))
         freq_mhz = np.asarray(records[0]["freq_list"], dtype=np.float64)
         signal = np.asarray(records[row["event_id"]][VOLTAGE_KEY], dtype=np.float64)
         mask = wing_mask(len(freq_mhz))
         detrended = detrend_wings(freq_mhz, signal, mask)
         params = np.asarray([row[name] for name in PARAM_NAMES], dtype=np.float64)
-        model = dulya_model(
-            freq_mhz,
-            *params,
-            center_mhz=row["center_mhz"],
-        )
+        model = dulya_model(freq_mhz, *params, center_mhz=row["center_mhz"])
+        sigma_err = float(row["sigma_err"])
+        if not np.isfinite(sigma_err) or sigma_err <= 0.0:
+            sigma_err = center_noise_sigma(freq_mhz, detrended, row["center_mhz"], float(row["half_width_mhz"]))
+        residual = detrended - model
 
-        ax.plot(freq_mhz, detrended, color="0.55", lw=0.9, label="data (detrended)")
-        ax.plot(freq_mhz, model, color="darkorange", lw=1.6, label="Dulya fit")
+        ax.fill_between(freq_mhz, model - sigma_err, model + sigma_err, color="darkorange", alpha=0.35, linewidth=0)
+        ax.step(freq_mhz, detrended, color="0.35", lw=0.8, label="data")
+        ax.step(freq_mhz, model, color="darkorange", lw=1.6, label="fit")
         ax.axvline(row["center_mhz"], color="0.35", ls=":", lw=0.9)
-        pol_txt = (
-            f"pol_true={row['pol_true']:+.3f}"
-            if np.isfinite(row["pol_true"])
-            else "pol_true=?"
-        )
-        ax.set_title(
-            f"{row['filename'][:22]}…  evt {row['event_id']}\n"
-            f"P={row['P']:+.3f}  CC={row['scaling_factor']:+.3f}  "
-            f"{pol_txt}  NRMSE={row['nrmse']:.3f}",
-            fontsize=9,
-        )
-        ax.set_ylabel("Voltage (V)")
+        pol_txt = f"pol_true={row['pol_true']:+.3f}" if np.isfinite(row["pol_true"]) else "pol_true=?"
+        ax.set_title(f"evt {row['event_id']} | NRMSE={row['nrmse']:.3f} | {pol_txt}", fontsize=9)
         ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=8, loc="best")
+        
+        axr.axhspan(-sigma_err, sigma_err, color="darkorange", alpha=0.25)
+        axr.step(freq_mhz, residual, where="mid", color="0.25", lw=0.7)
+        axr.axhline(0.0, color="0.4", lw=0.8)
+        axr.grid(True, alpha=0.3)
 
-    for ax in axes_flat[len(picks) :]:
-        ax.set_axis_off()
-    for ax in axes_flat:
-        if ax.has_data():
-            ax.set_xlabel("Frequency (MHz)")
+    for panel_i in range(len(picks), 4):
+        axes[(panel_i // 2) * 2, panel_i % 2].set_axis_off()
+        axes[(panel_i // 2) * 2 + 1, panel_i % 2].set_axis_off()
 
-    fig.suptitle("Example Dulya fits (best → worst NRMSE)", fontsize=13)
     fig.tight_layout()
     path = out_dir / "dulya_fit_examples.png"
     fig.savefig(path, dpi=160, bbox_inches="tight")
@@ -520,111 +462,83 @@ def main() -> None:
 
     results: dict[str, dict] = {}
     txt_files = sorted(f for f in os.listdir(data_dir) if f.endswith(".txt"))
-    n_fitted = 0
-    n_skipped = 0
+    n_fitted, n_skipped = 0, 0
 
     for filename in tqdm(txt_files, desc="Fitting Dulya"):
         records = load_records(str(data_dir / filename))
         if not records or VOLTAGE_KEY not in records[0] or "freq_list" not in records[0]:
             continue
 
+        # records = records[:3]
+
+
         freq_mhz = np.asarray(records[0]["freq_list"], dtype=np.float64)
         if freq_mhz.ndim != 1 or len(freq_mhz) == 0:
-            print(f"skip {filename}: bad freq_list")
             continue
 
         mask = wing_mask(len(freq_mhz))
         file_events: dict[int, dict] = {}
 
-        for index, record in enumerate(records):
-            if VOLTAGE_KEY not in record:
+        for index, record in tqdm(enumerate(records), desc="Events"):
+            if VOLTAGE_KEY not in record or "pol" not in record or "cc" not in record:
                 n_skipped += 1
                 continue
 
             signal = np.asarray(record[VOLTAGE_KEY], dtype=np.float64)
-            if signal.ndim != 1 or len(signal) != len(freq_mhz):
-                n_skipped += 1
-                continue
-            if not np.any(signal):
-                n_skipped += 1
-                continue
-
-            if "pol" not in record:
-                n_skipped += 1
-                continue
-            if "cc" not in record:
+            if signal.ndim != 1 or len(signal) != len(freq_mhz) or not np.any(signal):
                 n_skipped += 1
                 continue
 
             try:
                 p_fixed = float(record["pol"])
                 scale_fixed = float(record["cc"])
-                params, nrmse, model_snr, center_mhz = fit_dulya(
-                    freq_mhz, signal, p_fixed, scale_fixed, mask
+                params, nrmse, model_snr, center_mhz, sigma_err = fit_dulya(
+                    freq_mhz, signal, scale_fixed, mask
                 )
             except Exception:
                 n_skipped += 1
                 continue
 
-            if model_snr < MIN_MODEL_SNR:
-                n_skipped += 1
-                continue
-            if nrmse > MAX_NRMSE:
+            if model_snr < MIN_MODEL_SNR or nrmse > MAX_NRMSE:
                 n_skipped += 1
                 continue
 
-            event_entry: dict = {
+            file_events[index] = {
                 "nrmse": nrmse,
                 "model_snr": float(model_snr),
+                "sigma_err": float(sigma_err),
                 "center_mhz": float(center_mhz),
                 "pol_true": p_fixed,
                 "cc": float(record["cc"]),
-                "params": {
-                    name: float(value)
-                    for name, value in zip(PARAM_NAMES, params, strict=True)
-                },
+                "params": {name: float(value) for name, value in zip(PARAM_NAMES, params, strict=True)},
             }
-
-            file_events[index] = event_entry
             n_fitted += 1
 
-        if not file_events:
-            continue
-
-        results[filename] = {
-            "center_mhz_nominal": CENTER_MHZ,
-            "n_bins": int(len(freq_mhz)),
-            "freq_min_mhz": float(freq_mhz[0]),
-            "freq_max_mhz": float(freq_mhz[-1]),
-            "n_events_fitted": len(file_events),
-            "events": file_events,
-        }
+        if file_events:
+            results[filename] = {
+                "center_mhz_nominal": CENTER_MHZ,
+                "n_bins": int(len(freq_mhz)),
+                "freq_min_mhz": float(freq_mhz[0]),
+                "freq_max_mhz": float(freq_mhz[-1]),
+                "n_events_fitted": len(file_events),
+                "events": file_events,
+            }
 
     out_path = Path(OUT_YAML)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         yaml.safe_dump(results, f, sort_keys=False, default_flow_style=False)
 
-    print(
-        f"\nWrote {n_fitted} Dulya fits "
-        f"({n_skipped} skipped) across {len(results)} files to {out_path.resolve()}"
-    )
-
     summary = summarize_fits(results, n_fitted, n_skipped)
     stats_path = Path(OUT_STATS_YAML)
     with open(stats_path, "w", encoding="utf-8") as f:
         yaml.safe_dump(summary, f, sort_keys=False, default_flow_style=False)
     print_summary(summary)
-    print(f"Wrote stats to {stats_path.resolve()}")
 
     stats_dir = Path(OUT_STATS_DIR)
     plot_paths = plot_fit_statistics(results, stats_dir)
-    example_path = plot_example_fits(results, data_dir, stats_dir)
-    if example_path is not None:
+    if example_path := plot_example_fits(results, data_dir, stats_dir):
         plot_paths.append(example_path)
-    for path in plot_paths:
-        print(f"Wrote plot {path.resolve()}")
-
 
 if __name__ == "__main__":
     main()

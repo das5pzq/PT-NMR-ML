@@ -12,7 +12,9 @@ import tqdm
 from physics.Lineshape import DulyaFit, QmeterGain
 from physics.Modified_Baseline import Baseline
 from rgc_ranges import (
+    BASELINE_SAMPLE_KEYS,
     CENTER_MHZ,
+    DULYA_SAMPLE_KEYS,
     RGC_N_BINS,
     rgc_frequency_mhz,
     sample_rgc_params,
@@ -45,7 +47,7 @@ class RGCSignalGenerator:
         p = float(params["P"])
         cc = float(params["cc"])
         half_width = float(params["half_width_mhz"])
-        center = float(params["center_mhz"])
+        center = float(params.get("center_mhz", CENTER_MHZ))
         x_eff = self.freq_mhz - center
         x = x_eff / half_width
         shape = DulyaFit(
@@ -55,6 +57,13 @@ class RGCSignalGenerator:
             float(params["eta"]),
             float(params["phi"]),
             float(params["g"]),
+            g1_amp=float(params["g1_amp"]),
+            g1_loc=float(params["g1_loc"]),
+            g1_wid=float(params["g1_wid"]),
+            g2_amp=float(params["g2_amp"]),
+            g2_loc=float(params["g2_loc"]),
+            g2_wid=float(params["g2_wid"]),
+            powder_average=True,
         )
         area = float(np.sum(shape))
         gain = QmeterGain(x_eff, half_width, float(params["xi"]))
@@ -71,6 +80,20 @@ class RGCSignalGenerator:
             float(params["phi_const"]),
             float(params["DC_offset"]),
             "deuteron",
+            L0=float(params["L0"]),
+            Rcoil=float(params["Rcoil"]),
+            R=float(params["R"]),
+            R1=float(params["R1"]),
+            r=float(params["r"]),
+            alpha=float(params["alpha"]),
+            beta1=float(params["beta1"]),
+            Z_cable=float(params["Z_cable"]),
+            D=float(params["D"]),
+            M=float(params["M"]),
+            delta_C=float(params["delta_C"]),
+            delta_phi=float(params["delta_phi"]),
+            delta_phase=float(params["delta_phase"]),
+            delta_l=float(params["delta_l"]),
         )
 
     def _noise(self, size: int) -> np.ndarray:
@@ -124,16 +147,9 @@ class RGCSignalGenerator:
             snrs.append(sample["snr"])
             meta_rows.append(
                 {
-                    "eta": params["eta"],
-                    "phi": params["phi"],
-                    "g": params["g"],
-                    "xi": params["xi"],
-                    "half_width_mhz": params["half_width_mhz"],
-                    "U": params["U"],
-                    "Cknob": params["Cknob"],
-                    "trim": params["trim"],
-                    "phi_const": params["phi_const"],
-                    "DC_offset": params["DC_offset"],
+                    key: params[key]
+                    for key in (*DULYA_SAMPLE_KEYS, *BASELINE_SAMPLE_KEYS)
+                    if key not in ("P", "cc")
                 }
             )
             if (i + 1) % 10000 == 0:
