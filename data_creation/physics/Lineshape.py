@@ -166,6 +166,24 @@ def Lineshape(x,eps, eta, phi, g):
     return icurve(x,eps)/10
 
 
+def PowderLineshape(x, eps, eta, g, nphi=32):
+    """Azimuthally averaged Dulya branch for a powdered target."""
+    x_array = np.asarray(x, dtype=float)
+    original_shape = x_array.shape
+    x_flat = x_array.reshape(-1)
+    phis = np.linspace(0.0, 0.5 * np.pi, int(nphi) + 1)
+    weights = np.sqrt(3.0 / (3.0 - eta * np.cos(2.0 * phis)))
+    kernels = Lineshape(
+        x_flat[:, None],
+        eps,
+        eta,
+        phis[None, :],
+        g,
+    )
+    averaged = np.mean(kernels * weights[None, :], axis=1)
+    return averaged.reshape(original_shape)
+
+
 
 def GenerateVectorLineshape(P,x, CC, eta, phi, g):
 
@@ -189,7 +207,27 @@ def GenerateVectorLineshape(P,x, CC, eta, phi, g):
 
     return signal,Iplus,Iminus
 
-def DulyaFit(x, P, scaling_factor, eta, phi, g):
+import numpy as np
+
+import numpy as np
+
+def DulyaFit(
+    x,
+    P,
+    scaling_factor,
+    eta,
+    phi,
+    g,
+    *,
+    g1_amp=0.0,
+    g1_loc=-1.0,
+    g1_wid=0.1,
+    g2_amp=0.0,
+    g2_loc=1.0,
+    g2_wid=0.1,
+    powder_average=False,
+    nphi=32,
+):
     """Fitsub/basesub Dulya doublet: sign(P) reverses frequency; sum = P * scaling_factor."""
     x = np.asarray(x, dtype=float)
     p_signed = float(P)
@@ -197,17 +235,38 @@ def DulyaFit(x, P, scaling_factor, eta, phi, g):
     if p_mag < 1e-4:
         p_mag = 1e-4
         p_signed = 1e-4 if p_signed >= 0.0 else -1e-4
+    
+    # x is normalized by half_width in the calling function, 
+    # so the peaks are naturally near x = -1 and x = +1
     x_use = x if p_signed >= 0.0 else -x
 
     r = (np.sqrt(4.0 - 3.0 * p_mag**2) + p_mag) / (2.0 - 2.0 * p_mag)
-    i_plus = r * Lineshape(x_use, 1, eta, phi, g)
-    i_minus = Lineshape(x_use, -1, eta, phi, g)
+    if powder_average:
+        i_plus = r * PowderLineshape(x_use, 1, eta, g, nphi=nphi)
+        i_minus = PowderLineshape(x_use, -1, eta, g, nphi=nphi)
+    else:
+        i_plus = r * Lineshape(x_use, 1, eta, phi, g)
+        i_minus = Lineshape(x_use, -1, eta, phi, g)
 
-    p_summed = np.sum(i_plus + i_minus)
+    base_shape = i_plus + i_minus
+
+    # Calculate the two negative Gaussians
+    w1 = max(abs(g1_wid), 1e-6)
+    w2 = max(abs(g2_wid), 1e-6)
+    
+    gauss1 = g1_amp * np.exp(-0.5 * ((x_use - g1_loc) / w1)**2)
+    gauss2 = g2_amp * np.exp(-0.5 * ((x_use - g2_loc) / w2)**2)
+
+    # Apply the negative Gaussians and clamp to 0 to prevent unphysical negative values
+    modified_shape = np.maximum(base_shape - gauss1 - gauss2, 0.0)
+
+    # Calculate sum using the modified shape to ensure area matching logic holds
+    p_summed = np.sum(modified_shape)
     if p_summed == 0.0:
         return np.zeros_like(x, dtype=float)
+        
     delta_p = (p_signed / p_summed) * scaling_factor
-    return (i_plus + i_minus) * delta_p
+    return modified_shape * delta_p
 
 
 def QmeterGain(x_eff, split_ref, xi):
