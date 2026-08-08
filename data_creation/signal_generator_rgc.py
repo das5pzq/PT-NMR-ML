@@ -33,11 +33,13 @@ class RGCSignalGenerator:
         add_noise: bool = False,
         noise_level: float = 2.7e-5,
         seed: Optional[int] = None,
+        p_range: Optional[tuple[float, float]] = None,
     ) -> None:
         self.output_dir = output_dir
         self.num_samples = int(num_samples)
         self.add_noise = bool(add_noise)
         self.noise_level = float(noise_level)
+        self.p_range = p_range
         self.rng = np.random.default_rng(seed)
         self.freq_mhz = rgc_frequency_mhz()
         self.logger = logging.getLogger(LOGGER_NAME)
@@ -109,10 +111,11 @@ class RGCSignalGenerator:
         if noise_std <= 0.0:
             return None
         return float(np.max(np.abs(lineshape)) / noise_std)
+    
 
     def generate_one(self, params: Optional[dict[str, float]] = None) -> dict:
         if params is None:
-            params = sample_rgc_params(self.rng)
+            params = sample_rgc_params(self.rng, p_range=self.p_range)
         lineshape, area = self._lineshape(params)
         baseline = self._baseline(params)
         noise = self._noise(len(lineshape))
@@ -128,10 +131,17 @@ class RGCSignalGenerator:
         }
 
     def generate_samples(self, job_id: Optional[str] = None) -> str:
+        if self.p_range is not None:
+            self.logger.info(
+                "Sampling P uniformly in [%.6f, %.6f] (other params from fit pool)",
+                self.p_range[0],
+                self.p_range[1],
+            )
         self.logger.info("Generating %d RGC deuteron samples", self.num_samples)
 
         signals: List[np.ndarray] = []
         p_values: List[float] = []
+        q_values: List[float] = []
         cc_values: List[float] = []
         areas: List[float] = []
         snrs: List[Optional[float]] = []
@@ -142,6 +152,7 @@ class RGCSignalGenerator:
             params = sample["params"]
             signals.append(sample["signal"])
             p_values.append(float(params["P"]))
+            q_values.append(float(params["Q"]))
             cc_values.append(float(params["cc"]))
             areas.append(sample["area"])
             snrs.append(sample["snr"])
@@ -155,13 +166,14 @@ class RGCSignalGenerator:
             if (i + 1) % 10000 == 0:
                 self.logger.info("Generated %d/%d samples", i + 1, self.num_samples)
 
-        columns = self._build_columns(signals, p_values, cc_values, snrs, areas, meta_rows)
+        columns = self._build_columns(signals, p_values, q_values, cc_values, snrs, areas, meta_rows)
         return self._persist(columns, job_id)
 
     def _build_columns(
         self,
         signals: Sequence[np.ndarray],
         p_values: Sequence[float],
+        q_values: Sequence[float],
         cc_values: Sequence[float],
         snrs: Sequence[Optional[float]],
         areas: Sequence[float],
@@ -172,6 +184,7 @@ class RGCSignalGenerator:
             str(i): sig[:, i] for i in range(sig.shape[1])
         }
         columns["P"] = np.asarray(p_values, dtype=np.float64)
+        columns["Q"] = np.asarray(q_values, dtype=np.float64)
         columns["cc"] = np.asarray(cc_values, dtype=np.float64)
         columns["SNR"] = np.asarray(
             [np.nan if s is None else float(s) for s in snrs], dtype=np.float64

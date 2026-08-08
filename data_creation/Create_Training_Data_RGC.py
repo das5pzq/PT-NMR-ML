@@ -31,7 +31,31 @@ def parse_args() -> argparse.Namespace:
         help="Directory for output Parquet files",
     )
     parser.add_argument("--seed", type=int, default=None, help="RNG seed (optional)")
+    parser.add_argument(
+        "--p_min",
+        type=float,
+        default=None,
+        help="Minimum P for uniform sampling (requires --p_max; overrides fit YAML P values)",
+    )
+    parser.add_argument(
+        "--p_max",
+        type=float,
+        default=None,
+        help="Maximum P for uniform sampling (requires --p_min; overrides fit YAML P values)",
+    )
     return parser.parse_args()
+
+
+def resolve_p_range(args: argparse.Namespace) -> tuple[float, float] | None:
+    if args.p_min is None and args.p_max is None:
+        return None
+    if args.p_min is None or args.p_max is None:
+        raise ValueError("Both --p_min and --p_max must be provided to set a P sampling range")
+    if args.p_min > args.p_max:
+        raise ValueError(
+            f"--p_min must be <= --p_max, got p_min={args.p_min} p_max={args.p_max}"
+        )
+    return (args.p_min, args.p_max)
 
 
 def main() -> int:
@@ -42,12 +66,19 @@ def main() -> int:
     )
     logger = logging.getLogger("cli_rgc")
 
+    try:
+        p_range = resolve_p_range(args)
+    except ValueError as exc:
+        logger.error("%s", exc)
+        return 1
+
     generator = RGCSignalGenerator(
         output_dir=args.output_dir,
         num_samples=args.num_samples,
         add_noise=bool(args.add_noise),
         noise_level=args.noise_level,
         seed=args.seed,
+        p_range=p_range,
     )
     logger.info("Generating RGC signal data...")
 

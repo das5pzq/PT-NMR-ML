@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import yaml
@@ -184,17 +184,20 @@ def _sample_uniform_fallback(rng: np.random.Generator) -> dict[str, float]:
     return params
 
 
-def _sanitize_params(params: dict[str, float]) -> dict[str, float]:
-    out = {key: float(params[key]) for key in DULYA_SAMPLE_KEYS + BASELINE_SAMPLE_KEYS}
-    if abs(out["P"]) < 1e-4:
-        out["P"] = -1e-4 if out["P"] < 0.0 else 1e-4
-    if abs(out["cc"]) < 1e-6:
-        out["cc"] = -1.39
-    return out
+def _sample_p(rng: np.random.Generator, p_range: Optional[Tuple[float, float]]) -> Optional[float]:
+    if p_range is None:
+        return None
+    lo, hi = p_range
+    if lo > hi:
+        raise ValueError(f"p_range must satisfy lo <= hi, got ({lo}, {hi})")
+    return float(rng.uniform(lo, hi))
 
 
-def sample_rgc_params(rng: np.random.Generator | None = None) -> dict[str, float]:
-    """Draw one RGC parameter set from fitted events (bootstrap) or stats ranges."""
+def sample_rgc_params(
+    rng: np.random.Generator | None = None,
+    p_range: Optional[Tuple[float, float]] = None,
+) -> dict[str, float]:
+
     if rng is None:
         rng = np.random.default_rng()
 
@@ -204,7 +207,13 @@ def sample_rgc_params(rng: np.random.Generator | None = None) -> dict[str, float
     else:
         params = _sample_uniform_fallback(rng)
 
-    return _sanitize_params(params)
+    p_override = _sample_p(rng, p_range)
+    if p_override is not None:
+        params["P"] = p_override
+
+    params["Q"] = 2 - np.sqrt(4 - 3*params["P"]**2)
+
+    return params
 
 
 def rgc_frequency_mhz() -> np.ndarray:
