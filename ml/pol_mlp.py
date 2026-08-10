@@ -29,7 +29,6 @@ random.seed(42)
 np.random.seed(42)
 torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
-torch.set_float32_matmul_precision('medium' | 'high')
 
 def _accelerator():
     if torch.cuda.is_available():
@@ -40,81 +39,33 @@ def _accelerator():
 
 ACCELERATOR, N_DEVICES = _accelerator()
 
-# Front-end: 1 = first differences (kills DC), 2 = second differences (also kills linear trend)
-DIFF_ORDER = 1
-# When True, concatenate the per-event cc calibration factor as an extra MLP input.
-USE_CC = True
-
-
 class NMRDataset(Dataset):
-    def __init__(self, X, y, cc=None):
+    def __init__(self, X, y):
         self.X = torch.FloatTensor(X)
         self.y = torch.FloatTensor(y)
-        self.cc = None if cc is None else torch.FloatTensor(cc).reshape(-1, 1)
 
     def __len__(self):
         return len(self.X)
 
     def __getitem__(self, idx):
-        if self.cc is not None:
-            return self.X[idx], self.cc[idx], self.y[idx]
         return self.X[idx], self.y[idx]
 
-
-class SpectrumFrontEnd(nn.Module):
-    """
-    Differentiable high-pass + per-spectrum normalization.
-
-    This is not classical wing / polynomial baseline fitting: baselines stay in
-    the training data; the network learns on a representation that attenuates
-    slow components and equalizes per-trace scale.
-    """
-
-    def __init__(self, diff_order=1, eps=1e-5):
-        super().__init__()
-        if diff_order < 1:
-            raise ValueError("diff_order must be >= 1")
-        self.diff_order = int(diff_order)
-        self.eps = eps
-        # Normalize across the frequency axis for each spectrum independently.
-        self.norm = nn.InstanceNorm1d(1, affine=True, eps=eps)
-
-    def forward(self, x):
-        # x: (batch, 1, length)
-        for _ in range(self.diff_order):
-            x = x[..., 1:] - x[..., :-1]
-        return self.norm(x)
-
-
 class SimpleFeedForward(nn.Module):
-    """Front-end -> two fully-connected hidden layers -> linear output."""
-
-    def __init__(self, input_dim, hidden_dim=256, diff_order=DIFF_ORDER, use_cc=USE_CC):
+    def __init__(
+        self,
+        input_dim,
+        hidden_dim=256,
+    ):
         super().__init__()
-        self.use_cc = bool(use_cc)
-        # self.front_end = SpectrumFrontEnd(diff_order=diff_order)
-        feat_dim = input_dim - self.front_end.diff_order
-        if feat_dim < 1:
-            raise ValueError(
-                f"input_dim={input_dim} too small for diff_order={self.front_end.diff_order}"
-            )
-        if self.use_cc:
-            feat_dim += 1
         self.net = nn.Sequential(
-            nn.Linear(feat_dim, hidden_dim),
+            nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, x, cc=None):
-        # x: (batch, length) -> front-end expects (batch, 1, length)
-        # x = self.front_end(x.unsqueeze(1)).squeeze(1)
-        if self.use_cc:
-            if cc is None:
-                raise ValueError("use_cc=True but cc was not provided")
-            x = torch.cat([x, cc], dim=1)
+    def forward(self, x):
         return self.net(x)
 
 
@@ -124,45 +75,40 @@ class FFLightningModule(LightningModule):
         input_dim=512,
         hidden_dim=256,
         learning_rate=1e-3,
-        diff_order=DIFF_ORDER,
-        use_cc=USE_CC,
     ):
         super().__init__()
         self.save_hyperparameters()
         self.model = SimpleFeedForward(
-            input_dim, hidden_dim, diff_order=diff_order, use_cc=use_cc
+            input_dim,
+            hidden_dim,
         )
         self.criterion = nn.MSELoss()
         self.learning_rate = learning_rate
-        self.use_cc = bool(use_cc)
 
-    def forward(self, x, cc=None):
-        return self.model(x, cc=cc)
+    def forward(self, x):
+        return self.model(x)
 
     def _unpack_batch(self, batch):
-        if self.use_cc:
-            x, cc, y = batch
-            return x, cc, y
         x, y = batch
-        return x, None, y
+        return x, y
 
     def training_step(self, batch, batch_idx):
-        x, cc, y = self._unpack_batch(batch)
-        y_hat = self(x, cc=cc)
+        x, y = self._unpack_batch(batch)
+        y_hat = self(x)
         loss = self.criterion(y_hat, y)
         self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log('train_mae', F.l1_loss(y_hat, y), on_step=False, on_epoch=True, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        x, cc, y = self._unpack_batch(batch)
-        y_hat = self(x, cc=cc)
+        x, y = self._unpack_batch(batch)
+        y_hat = self(x)
         self.log('val_loss', self.criterion(y_hat, y), on_step=False, on_epoch=True, prog_bar=True)
         self.log('val_mae', F.l1_loss(y_hat, y), on_step=False, on_epoch=True, prog_bar=True)
 
     def test_step(self, batch, batch_idx):
-        x, cc, y = self._unpack_batch(batch)
-        y_hat = self(x, cc=cc)
+        x, y = self._unpack_batch(batch)
+        y_hat = self(x)
         self.log('test_loss', self.criterion(y_hat, y), on_step=False, on_epoch=True, prog_bar=True)
         self.log('test_mae', F.l1_loss(y_hat, y), on_step=False, on_epoch=True, prog_bar=True)
 
@@ -174,14 +120,86 @@ class FFLightningModule(LightningModule):
         return {'optimizer': optimizer, 'lr_scheduler': {'scheduler': scheduler, 'monitor': 'val_loss'}}
 
 
+def _find_resume_checkpoint(model_dir):
+    """Return (path, is_lightning_ckpt) preferring best validation weights."""
+    best_ckpt = os.path.join(model_dir, "best_model_checkpoint.ckpt")
+    if os.path.isfile(best_ckpt):
+        return best_ckpt, True
+    best_pth = os.path.join(model_dir, "best_model.pth")
+    if os.path.isfile(best_pth):
+        return best_pth, False
+    return None, False
+
+
+def _load_or_create_model(
+    model_dir,
+    input_dim,
+    hidden_dim,
+    learning_rate,
+    resume=True,
+    full_resume=False,
+):
+    if not resume:
+        return FFLightningModule(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            learning_rate=learning_rate,
+        ), None
+
+    ckpt_path, is_lightning_ckpt = _find_resume_checkpoint(model_dir)
+    if ckpt_path is None:
+        print("No existing model found. Building new model...")
+        return FFLightningModule(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            learning_rate=learning_rate,
+        ), None
+
+    fit_ckpt_path = ckpt_path if (full_resume and is_lightning_ckpt) else None
+    if ckpt_path.endswith(".pth"):
+        print(f"Loading best model weights from {ckpt_path}")
+        model = FFLightningModule(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            learning_rate=learning_rate,
+        )
+        state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        model.model.load_state_dict(state_dict)
+    else:
+        resume_kind = "full training state" if fit_ckpt_path else "best weights"
+        print(f"Resuming from {ckpt_path} ({resume_kind})")
+        model = FFLightningModule.load_from_checkpoint(ckpt_path, map_location='cuda', weights_only=False)
+        model.learning_rate = learning_rate
+
+    return model, fit_ckpt_path
+
+
+def _load_prior_loss_history(save_path):
+    if not os.path.isfile(save_path):
+        return None
+    history = pd.read_csv(save_path)
+    if history.empty:
+        return None
+    return history
+
+
 class LossHistoryCallback(Callback):
-    def __init__(self, save_path):
+    def __init__(self, save_path, prior_history=None):
         super().__init__()
         self.save_path = save_path
         self.epoch_train_loss = []
         self.epoch_val_loss = []
         self.epoch_train_mae = []
         self.epoch_val_mae = []
+        if prior_history is not None:
+            for col, buf in (
+                ("train_loss", self.epoch_train_loss),
+                ("val_loss", self.epoch_val_loss),
+                ("train_mae", self.epoch_train_mae),
+                ("val_mae", self.epoch_val_mae),
+            ):
+                if col in prior_history.columns:
+                    buf.extend(prior_history[col].dropna().tolist())
 
     def on_validation_epoch_end(self, trainer, pl_module):
         m = trainer.callback_metrics
@@ -191,7 +209,12 @@ class LossHistoryCallback(Callback):
         if 'val_mae'    in m: self.epoch_val_mae.append(float(m['val_mae'].cpu()))
 
     def on_fit_end(self, trainer, pl_module):
-        n = max(len(self.epoch_train_loss), len(self.epoch_val_loss))
+        n = max(
+            len(self.epoch_train_loss),
+            len(self.epoch_val_loss),
+            len(self.epoch_train_mae),
+            len(self.epoch_val_mae),
+        )
         if n == 0:
             return
         pd.DataFrame({
@@ -204,56 +227,74 @@ class LossHistoryCallback(Callback):
         print(f"Saved loss history to {self.save_path}")
 
 
+class SetLearningRateCallback(Callback):
+    """Apply module learning_rate after Lightning restores a checkpoint."""
+
+    def on_fit_start(self, trainer, pl_module):
+        if not trainer.optimizers:
+            return
+        for param_group in trainer.optimizers[0].param_groups:
+            param_group['lr'] = pl_module.learning_rate
+
+
 def train_model(X_train, y_train, X_val, y_val, X_test, y_test,
                 model_dir, performance_dir, version,
                 num_workers=4, learning_rate=1e-3, max_epochs=500,
-                hidden_dim=256, batch_size=256, diff_order=DIFF_ORDER,
-                use_cc=USE_CC, cc_train=None, cc_val=None, cc_test=None):
+                hidden_dim=256, batch_size=256,
+                resume=True, full_resume=False):
 
     pin = torch.cuda.is_available()
-    if use_cc and (cc_train is None or cc_val is None or cc_test is None):
-        raise ValueError("use_cc=True requires cc_train, cc_val, and cc_test")
 
     train_loader = DataLoader(
-        NMRDataset(X_train, y_train, cc=cc_train if use_cc else None),
+        NMRDataset(X_train, y_train),
         batch_size=batch_size, shuffle=True,
         num_workers=num_workers, pin_memory=pin,
         persistent_workers=num_workers > 0,
     )
     val_loader = DataLoader(
-        NMRDataset(X_val, y_val, cc=cc_val if use_cc else None),
+        NMRDataset(X_val, y_val),
         batch_size=batch_size, shuffle=False,
         num_workers=num_workers, pin_memory=pin,
         persistent_workers=num_workers > 0,
     )
     test_loader = DataLoader(
-        NMRDataset(X_test, y_test, cc=cc_test if use_cc else None),
+        NMRDataset(X_test, y_test),
         batch_size=batch_size, shuffle=False,
         num_workers=num_workers, pin_memory=pin,
         persistent_workers=num_workers > 0,
     )
 
     input_dim = X_train.shape[1]
-    checkpoint_path = f"{model_dir}/best_model_checkpoint.ckpt"
-    if os.path.exists(checkpoint_path):
-        print(f"Resuming from {checkpoint_path}")
-        model = FFLightningModule.load_from_checkpoint(checkpoint_path)
-    else:
-        model = FFLightningModule(
-            input_dim=input_dim,
-            hidden_dim=hidden_dim,
-            learning_rate=learning_rate,
-            diff_order=diff_order,
-            use_cc=use_cc,
-        )
+    loss_history_path = f"{performance_dir}/{version}_loss.csv"
+    prior_loss_history = _load_prior_loss_history(loss_history_path) if resume else None
 
-    checkpoint_cb = ModelCheckpoint(dirpath=model_dir, filename='best_model_checkpoint',
-                                    monitor='val_loss', save_top_k=1, mode='min', save_last=True)
-    loss_cb = LossHistoryCallback(save_path=f"{performance_dir}/{version}_loss.csv")
+    model, fit_ckpt_path = _load_or_create_model(
+        model_dir,
+        input_dim,
+        hidden_dim,
+        learning_rate,
+        resume=resume,
+        full_resume=full_resume,
+    )
+
+    callbacks = [
+        ModelCheckpoint(
+            dirpath=model_dir,
+            filename='best_model_checkpoint',
+            monitor='val_loss',
+            save_top_k=1,
+            mode='min',
+            save_last=True,
+        ),
+        LearningRateMonitor(),
+        LossHistoryCallback(save_path=loss_history_path, prior_history=prior_loss_history),
+    ]
+    if fit_ckpt_path is not None:
+        callbacks.append(SetLearningRateCallback())
 
     trainer = Trainer(
         max_epochs=max_epochs,
-        callbacks=[checkpoint_cb, LearningRateMonitor(), loss_cb],
+        callbacks=callbacks,
         logger=CSVLogger(performance_dir, name='training_log'),
         accelerator=ACCELERATOR,
         devices=N_DEVICES,
@@ -261,11 +302,12 @@ def train_model(X_train, y_train, X_val, y_val, X_test, y_test,
         enable_progress_bar=True,
     )
 
-    trainer.fit(model, train_loader, val_loader)
+    trainer.fit(model, train_loader, val_loader, ckpt_path=fit_ckpt_path)
 
+    checkpoint_cb = callbacks[0]
     best_ckpt = checkpoint_cb.best_model_path
     if best_ckpt and os.path.isfile(best_ckpt):
-        best_module = FFLightningModule.load_from_checkpoint(best_ckpt)
+        best_module = FFLightningModule.load_from_checkpoint(best_ckpt, weights_only=False)
         torch.save(best_module.model.state_dict(), f"{model_dir}/best_model.pth")
         model = best_module
     else:
@@ -276,24 +318,27 @@ def train_model(X_train, y_train, X_val, y_val, X_test, y_test,
 
 
 if __name__ == "__main__":
-    data_path = "data/Training_Data_RGC_1M.parquet"
-    version = 'RGC_MLP_V1'
+    data_path = "data/Training_Data_RGC_3_55_500K.parquet"
+    version = 'RGC_MLP_3_55_V4'
     performance_dir = f"Model_Performance/{version}"
     model_dir = f"Models/{version}"
     os.makedirs(performance_dir, exist_ok=True)
     os.makedirs(model_dir, exist_ok=True)
 
     df = pd.read_parquet(data_path)
-    n_before = len(df)
-    df = df[(df["P"] <= -0.15) | (df["P"] >= 0.15)].reset_index(drop=True)
-    print(f"Excluded |P| < 0.15: {n_before} -> {len(df)} samples")
     signal_cols = df.columns[0:512]
 
-    scaler = MinMaxScaler()
     scaler_path = f"{performance_dir}/{version}_scaler.pkl"
-    scaler.fit(df[signal_cols].values.astype('float32'))
-    with open(scaler_path, 'wb') as f:
-        pickle.dump(scaler, f)
+    if os.path.isfile(scaler_path):
+        with open(scaler_path, 'rb') as f:
+            scaler = pickle.load(f)
+        print(f"Loaded existing scaler from {scaler_path}")
+    else:
+        scaler = MinMaxScaler()
+        scaler.fit(df[signal_cols].values.astype('float32'))
+        with open(scaler_path, 'wb') as f:
+            pickle.dump(scaler, f)
+        print(f"Fitted and saved new scaler to {scaler_path}")
 
     df_train, df_temp = train_test_split(df, test_size=0.2, random_state=42)
     df_val, df_test = train_test_split(df_temp, test_size=1 / 3, random_state=42)
@@ -315,19 +360,6 @@ if __name__ == "__main__":
     y_test = df_test["P"].values.astype('float32').reshape(-1, 1)
     test_SNR = df_test["SNR"].values.astype('float32')
 
-    cc_train = cc_val = cc_test = None
-    cc_scaler = None
-    if USE_CC:
-        if "cc" not in df_train.columns:
-            raise ValueError("USE_CC=True but parquet has no 'cc' column")
-        cc_scaler = StandardScaler()
-        cc_train = cc_scaler.fit_transform(df_train["cc"].values.astype('float32').reshape(-1, 1))
-        cc_val = cc_scaler.transform(df_val["cc"].values.astype('float32').reshape(-1, 1))
-        cc_test = cc_scaler.transform(df_test["cc"].values.astype('float32').reshape(-1, 1))
-        cc_scaler_path = f"{performance_dir}/{version}_cc_scaler.pkl"
-        with open(cc_scaler_path, 'wb') as f:
-            pickle.dump(cc_scaler, f)
-
     print(f"Number of training data points: {len(df_train)}")
 
     del df_train, df_val, df_test
@@ -337,20 +369,27 @@ if __name__ == "__main__":
 
     num_workers  = 13
     learning_rate = 3e-4
-    max_epochs   = 1000
-    hidden_dim   = 32
-    batch_size   = 32
+    max_epochs   = 500
+    hidden_dim   = 256
+    batch_size   = 512
 
     print("\n" + "=" * 60)
     print("Training MLP Model")
-    print(f"Front-end: diff_order={DIFF_ORDER}, InstanceNorm, use_cc={USE_CC}")
     print("=" * 60)
+
+    resume_training = True
+    full_resume = False  # set True to also restore optimizer/epoch state from best_model_checkpoint.ckpt
 
     model, trainer = train_model(
         X_train, y_train, X_val, y_val, X_test, y_test,
         model_dir, performance_dir, version,
-        num_workers, learning_rate, max_epochs, hidden_dim,
-        batch_size, DIFF_ORDER, USE_CC, cc_train, cc_val, cc_test,
+        num_workers=num_workers,
+        learning_rate=learning_rate,
+        max_epochs=max_epochs,
+        hidden_dim=hidden_dim,
+        batch_size=batch_size,
+        resume=resume_training,
+        full_resume=full_resume,
     )
 
     print("\n" + "=" * 60)
@@ -359,18 +398,14 @@ if __name__ == "__main__":
 
     test_loader = DataLoader(NMRDataset(X_test, y_test), batch_size=batch_size, shuffle=False,
                              num_workers=num_workers, pin_memory=torch.cuda.is_available(),
-                             persistent_workers=num_workers > 0)
+                             persistent_workers=True)
 
     model.eval()
     predictions = []
     with torch.no_grad():
         for batch in test_loader:
-            if USE_CC:
-                x, cc, _ = batch
-                predictions.append(model(x, cc=cc).cpu().numpy())
-            else:
-                x, _ = batch
-                predictions.append(model(x).cpu().numpy())
+            x, _ = batch
+            predictions.append(model(x).cpu().numpy())
 
     y_pred = np.concatenate(predictions, axis=0)
     y_test_flat = y_test.flatten() * 100.0
@@ -380,7 +415,6 @@ if __name__ == "__main__":
     mae  = np.mean(np.abs(y_test_flat - y_pred_flat))
     rmse = np.sqrt(mse)
     rpe  = np.abs(y_pred_flat - y_test_flat) / y_test_flat * 100
-    rpe_95 = rpe[rpe <= np.percentile(rpe, 95)]
 
     print(f"\nTest Set Metrics:")
     print(f"  MSE:      {mse:.6f}")
@@ -394,7 +428,7 @@ if __name__ == "__main__":
     plt.xlabel('Polarization RPE')
     plt.ylabel('Frequency')
     plt.title('Polarization RPE Distribution')
-    plt.figtext(0.65, 0.8, f"Mean: {rpe.mean():.5f}%\nStd: {rpe.std():.5f}%",
+    plt.figtext(0.65, 0.8, f"Mean: {rpe.mean():.5f}%",
                 fontsize=12, bbox=dict(boxstyle="round,pad=0.5", fc='red', ec="none", alpha=0.8),
                 color='white')
     plt.tight_layout()
@@ -434,9 +468,6 @@ if __name__ == "__main__":
         json.dump({
             'MSE': float(mse), 'MAE': float(mae), 'RMSE': float(rmse),
             'Mean_RPE': float(rpe.mean()), 'Std_RPE': float(rpe.std()),
-            'Mean_RPE_95th': float(rpe_95.mean()), 'Std_RPE_95th': float(rpe_95.std()),
-            'use_cc': USE_CC,
-            'diff_order': DIFF_ORDER,
         }, f, indent=4)
 
     loss_csv = f"{performance_dir}/{version}_loss.csv"
@@ -451,22 +482,6 @@ if __name__ == "__main__":
         plt.tight_layout()
         plt.savefig(f"{performance_dir}/{version}_loss.png", dpi=600)
         plt.close()
-
-    # Save a one-sample front-end preview for sanity checking
-    with torch.no_grad():
-        x0 = torch.from_numpy(X_test[:1])
-        z0 = model.model.front_end(x0.unsqueeze(1)).squeeze().cpu().numpy()
-    fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=False)
-    axes[0].plot(X_test[0], lw=1.0)
-    axes[0].set_title(f"Input spectrum (baseline included)  P={y_test[0, 0]:.4f}")
-    axes[0].set_ylabel("Signal")
-    axes[1].plot(z0, lw=1.0, color="#b22222")
-    axes[1].set_title("After SpectrumFrontEnd (diff + InstanceNorm)")
-    axes[1].set_xlabel("Bin")
-    axes[1].set_ylabel("Front-end out")
-    fig.tight_layout()
-    fig.savefig(f"{performance_dir}/{version}_frontend_preview.png", dpi=200)
-    plt.close()
 
     print("\n" + "=" * 60)
     print("Done!")
