@@ -23,7 +23,7 @@ cd data_creation/fitting
 python fit-dulya.py
 ```
 
-Each script opens a plot when it finishes. You need Python with `numpy`, `scipy`, and `matplotlib` installed.
+Each script opens a plot when it finishes.
 
 ---
 
