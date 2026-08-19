@@ -57,16 +57,15 @@ class SimpleFeedForward(nn.Module):
         hidden_dim=256,
     ):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-        )
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        self.p_head = nn.Linear(hidden_dim, 1)
+        self.q_head = nn.Linear(hidden_dim, 1)
 
     def forward(self, x):
-        return self.net(x)
+        h = F.relu(self.input_proj(x))
+        p = self.p_head(h)
+        q = self.q_head(h.detach())
+        return torch.cat([p, q], dim=-1)
 
 
 class FFLightningModule(LightningModule):
@@ -75,6 +74,7 @@ class FFLightningModule(LightningModule):
         input_dim=512,
         hidden_dim=256,
         learning_rate=1e-3,
+        max_epochs=500,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -84,33 +84,47 @@ class FFLightningModule(LightningModule):
         )
         self.criterion = nn.MSELoss()
         self.learning_rate = learning_rate
+        self.max_epochs = max_epochs
 
     def forward(self, x):
         return self.model(x)
 
 
+    def _split_losses(self, y_hat, y):
+        loss_p = self.criterion(y_hat[:, 0:1], y[:, 0:1])
+        loss_q = self.criterion(y_hat[:, 1:2], y[:, 1:2])
+        return loss_p + loss_q, loss_p, loss_q
+
     def training_step(self, batch, batch_idx):
         x, y = batch
         y_hat = self(x)
-        loss = self.criterion(y_hat, y)
+        loss, loss_p, loss_q = self._split_losses(y_hat, y)
         self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('train_loss_p', loss_p, on_step=False, on_epoch=True)
+        self.log('train_loss_q', loss_q, on_step=False, on_epoch=True)
         self.log('train_mae', F.l1_loss(y_hat, y), on_step=False, on_epoch=True, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         x, y = batch
         y_hat = self(x)
-        self.log('val_loss', self.criterion(y_hat, y), on_step=False, on_epoch=True, prog_bar=True)
+        loss, loss_p, loss_q = self._split_losses(y_hat, y)
+        self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('val_loss_p', loss_p, on_step=False, on_epoch=True)
+        self.log('val_loss_q', loss_q, on_step=False, on_epoch=True)
         self.log('val_mae', F.l1_loss(y_hat, y), on_step=False, on_epoch=True, prog_bar=True)
 
     def test_step(self, batch, batch_idx):
         x, y = batch
         y_hat = self(x)
-        self.log('test_loss', self.criterion(y_hat, y), on_step=False, on_epoch=True, prog_bar=True)
+        loss, loss_p, loss_q = self._split_losses(y_hat, y)
+        self.log('test_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('test_loss_p', loss_p, on_step=False, on_epoch=True)
+        self.log('test_loss_q', loss_q, on_step=False, on_epoch=True)
         self.log('test_mae', F.l1_loss(y_hat, y), on_step=False, on_epoch=True, prog_bar=True)
 
     def configure_optimizers(self):
-        optimizer = optim.AdamW(self.parameters(), lr=self.learning_rate, weight_decay=1e-5)
+        optimizer = optim.AdamW(self.parameters(), lr=self.learning_rate)
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=self.max_epochs, eta_min=1e-7
         )
@@ -121,7 +135,8 @@ def _load_or_create_model(
     model_dir,
     input_dim,
     hidden_dim,
-    learning_rate
+    learning_rate,
+    max_epochs,
 ):
 
     ckpt_path = os.path.join(model_dir, "best_model_checkpoint.ckpt")
@@ -132,11 +147,18 @@ def _load_or_create_model(
             input_dim=input_dim,
             hidden_dim=hidden_dim,
             learning_rate=learning_rate,
+            max_epochs=max_epochs,
         ), None
 
     print(f"Resuming from {ckpt_path})")
-    model = FFLightningModule.load_from_checkpoint(ckpt_path, map_location='cuda', weights_only=False)
+    model = FFLightningModule.load_from_checkpoint(
+        ckpt_path,
+        map_location='cuda',
+        weights_only=False,
+        max_epochs=max_epochs,
+    )
     model.learning_rate = learning_rate
+    model.max_epochs = max_epochs
 
     return model, ckpt_path
 
@@ -238,7 +260,8 @@ def train_model(X_train, y_train, X_val, y_val, X_test, y_test,
         model_dir,
         input_dim,
         hidden_dim,
-        learning_rate
+        learning_rate,
+        max_epochs,
     )
 
     callbacks = [

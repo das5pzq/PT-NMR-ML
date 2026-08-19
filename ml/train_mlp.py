@@ -24,8 +24,8 @@ device = torch.device('cuda')
 
 
 if __name__ == "__main__":
-    data_path = "data/Training_Data_RGC_3_55_500K.parquet"
-    version = 'RGC_MLP_3_55_V4'
+    data_path = "data/Training_Data_RGC_17_34_1M.parquet"
+    version = 'Training_Data_RGC_17_34_1M_V1'
     performance_dir = f"Model_Performance/{version}"
     model_dir = f"Models/{version}"
     os.makedirs(performance_dir, exist_ok=True)
@@ -62,9 +62,9 @@ if __name__ == "__main__":
 
     print(f"Scaled signal range (train): {X_train.min():.4f} to {X_train.max():.4f}")
 
-    y_train = df_train["P"].values.astype('float32').reshape(-1, 1)
-    y_val = df_val["P"].values.astype('float32').reshape(-1, 1)
-    y_test = df_test["P"].values.astype('float32').reshape(-1, 1)
+    y_train = df_train[["P", "Q"]].values.astype('float32')
+    y_val = df_val[["P", "Q"]].values.astype('float32')
+    y_test = df_test[["P", "Q"]].values.astype('float32')
     test_SNR = df_test["SNR"].values.astype('float32')
 
     print(f"Number of training data points: {len(df_train)}")
@@ -78,14 +78,11 @@ if __name__ == "__main__":
     learning_rate = 3e-4
     max_epochs   = 500
     hidden_dim   = 256
-    batch_size   = 512
+    batch_size   = 64
 
     print("\n" + "=" * 60)
     print("Training MLP Model")
     print("=" * 60)
-
-    resume_training = True
-    full_resume = False  # set True to also restore optimizer/epoch state from best_model_checkpoint.ckpt
 
     model, trainer = train_model(
         X_train, y_train, X_val, y_val, X_test, y_test,
@@ -95,8 +92,6 @@ if __name__ == "__main__":
         max_epochs=max_epochs,
         hidden_dim=hidden_dim,
         batch_size=batch_size,
-        resume=resume_training,
-        full_resume=full_resume,
     )
 
     print("\n" + "=" * 60)
@@ -115,67 +110,77 @@ if __name__ == "__main__":
             predictions.append(model(x).cpu().numpy())
 
     y_pred = np.concatenate(predictions, axis=0)
-    y_test_flat = y_test.flatten() * 100.0
-    y_pred_flat = y_pred.flatten() * 100.0
-
-    mse  = np.mean((y_test_flat - y_pred_flat) ** 2)
-    mae  = np.mean(np.abs(y_test_flat - y_pred_flat))
-    rmse = np.sqrt(mse)
-    rpe  = np.abs(y_pred_flat - y_test_flat) / y_test_flat * 100
-
-    print(f"\nTest Set Metrics:")
-    print(f"  MSE:      {mse:.6f}")
-    print(f"  MAE:      {mae:.6f}")
-    print(f"  RMSE:     {rmse:.6f}")
-    print(f"  Mean RPE: {rpe.mean():.5f}%")
+    targets = ("P", "Q")
+    metrics = {}
 
     plt.style.use('ggplot')
 
-    plt.hist(rpe, bins=30, alpha=0.7, edgecolor='red')
-    plt.xlabel('Polarization RPE')
-    plt.ylabel('Frequency')
-    plt.title('Polarization RPE Distribution')
-    plt.figtext(0.65, 0.8, f"Mean: {rpe.mean():.5f}%",
-                fontsize=12, bbox=dict(boxstyle="round,pad=0.5", fc='red', ec="none", alpha=0.8),
-                color='white')
-    plt.tight_layout()
-    plt.savefig(f"{performance_dir}/{version}_rpe_histogram.png", dpi=600)
-    plt.close()
+    results = {'SNR': test_SNR}
+    for idx, name in enumerate(targets):
+        y_true = y_test[:, idx] * 100.0
+        y_hat = y_pred[:, idx] * 100.0
+        residuals = y_true - y_hat
+        rpe = np.abs(y_hat - y_true) / np.abs(y_true) * 100
 
-    residuals = y_test_flat - y_pred_flat
+        mse = np.mean((y_true - y_hat) ** 2)
+        mae = np.mean(np.abs(y_true - y_hat))
+        rmse = np.sqrt(mse)
+        metrics[name] = {
+            'MSE': float(mse),
+            'MAE': float(mae),
+            'RMSE': float(rmse),
+            'Mean_RPE': float(rpe.mean()),
+            'Std_RPE': float(rpe.std()),
+        }
 
-    plt.figure(figsize=(10, 8))
-    plt.scatter(y_test_flat, y_pred_flat, alpha=0.5, s=1)
-    lo, hi = min(y_test_flat.min(), y_pred_flat.min()), max(y_test_flat.max(), y_pred_flat.max())
-    plt.plot([lo, hi], [lo, hi], 'r--', lw=2, label='Perfect Prediction')
-    plt.xlabel('Actual Polarization (%)')
-    plt.ylabel('Predicted Polarization (%)')
-    plt.title('Actual vs Predicted Polarization')
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(f"{performance_dir}/{version}_actual_vs_predicted.png", dpi=600)
-    plt.close()
+        print(f"\nTest Set Metrics ({name}):")
+        print(f"  MSE:      {mse:.6f}")
+        print(f"  MAE:      {mae:.6f}")
+        print(f"  RMSE:     {rmse:.6f}")
+        print(f"  Mean RPE: {rpe.mean():.5f}%")
 
-    plt.figure(figsize=(10, 6))
-    plt.scatter(y_test_flat, residuals, alpha=0.5, s=1)
-    plt.axhline(0, color='r', linestyle='--', lw=2)
-    plt.xlabel('Actual Polarization (%)')
-    plt.ylabel('Residuals (%)')
-    plt.title('Residuals Plot')
-    plt.tight_layout()
-    plt.savefig(f"{performance_dir}/{version}_residuals.png", dpi=600)
-    plt.close()
+        plt.hist(rpe, bins=30, alpha=0.7, edgecolor='red')
+        plt.xlabel(f'{name} RPE')
+        plt.ylabel('Frequency')
+        plt.title(f'{name} RPE Distribution')
+        plt.figtext(0.65, 0.8, f"Mean: {rpe.mean():.5f}%",
+                    fontsize=12, bbox=dict(boxstyle="round,pad=0.5", fc='red', ec="none", alpha=0.8),
+                    color='white')
+        plt.tight_layout()
+        plt.savefig(f"{performance_dir}/{version}_{name.lower()}_rpe_histogram.png", dpi=600)
+        plt.close()
 
-    pd.DataFrame({
-        'Actual': y_test_flat, 'Predicted': y_pred_flat,
-        'Residuals': residuals, 'RPE': rpe, 'SNR': test_SNR,
-    }).to_csv(f"{performance_dir}/{version}_results.csv", index=False)
+        plt.figure(figsize=(10, 8))
+        plt.scatter(y_true, y_hat, alpha=0.5, s=1)
+        lo, hi = min(y_true.min(), y_hat.min()), max(y_true.max(), y_hat.max())
+        plt.plot([lo, hi], [lo, hi], 'r--', lw=2, label='Perfect Prediction')
+        plt.xlabel(f'Actual {name} (%)')
+        plt.ylabel(f'Predicted {name} (%)')
+        plt.title(f'Actual vs Predicted {name}')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(f"{performance_dir}/{version}_{name.lower()}_actual_vs_predicted.png", dpi=600)
+        plt.close()
+
+        plt.figure(figsize=(10, 6))
+        plt.scatter(y_true, residuals, alpha=0.5, s=1)
+        plt.axhline(0, color='r', linestyle='--', lw=2)
+        plt.xlabel(f'Actual {name} (%)')
+        plt.ylabel('Residuals (%)')
+        plt.title(f'{name} Residuals Plot')
+        plt.tight_layout()
+        plt.savefig(f"{performance_dir}/{version}_{name.lower()}_residuals.png", dpi=600)
+        plt.close()
+
+        results[f'Actual_{name}'] = y_true
+        results[f'Predicted_{name}'] = y_hat
+        results[f'Residuals_{name}'] = residuals
+        results[f'RPE_{name}'] = rpe
+
+    pd.DataFrame(results).to_csv(f"{performance_dir}/{version}_results.csv", index=False)
 
     with open(f"{performance_dir}/{version}_metrics_summary.json", "w") as f:
-        json.dump({
-            'MSE': float(mse), 'MAE': float(mae), 'RMSE': float(rmse),
-            'Mean_RPE': float(rpe.mean()), 'Std_RPE': float(rpe.std()),
-        }, f, indent=4)
+        json.dump(metrics, f, indent=4)
 
     loss_csv = f"{performance_dir}/{version}_loss.csv"
     if os.path.exists(loss_csv):
