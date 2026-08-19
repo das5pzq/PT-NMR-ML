@@ -224,4 +224,6 @@ Test/
 data/
 data-d
 
-
+*.out
+*.err
+*.log
