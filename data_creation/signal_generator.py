@@ -422,8 +422,8 @@ class SignalGenerator:
         )
 
     def _generate_vector_signal(self, P: float) -> Tuple[np.ndarray, float, np.ndarray]:
-        X = np.linspace(self.center_freq - 6, self.center_freq + 6, 500)
-        R = np.linspace(-6, 6, 500)
+        X = np.linspace(self.center_freq - 6, self.center_freq + 6, 512)
+        R = np.linspace(-6, 6, 512)
 
         # Sample baseline parameters once if varying
         if self.baseline_cfg.vary_baseline:
@@ -435,10 +435,10 @@ class SignalGenerator:
             phi_to_use = self.phi
 
         if self.shifting:
-            lineshape = SamplingVectorLineshape(P, R, self.bound, 3.528*CC, self.baseline_cfg.eta, phi_to_use, self.baseline_cfg.g)
+            lineshape = SamplingVectorLineshape(P, R, self.bound, CC, self.baseline_cfg.eta, phi_to_use, self.baseline_cfg.g)
             area = trapezoid(lineshape, R)
         else:
-            lineshape, _, _ = GenerateVectorLineshape(P, R, 3.528*CC, self.baseline_cfg.eta, phi_to_use, self.baseline_cfg.g)
+            lineshape, _, _ = GenerateVectorLineshape(P, R, CC, self.baseline_cfg.eta, phi_to_use, self.baseline_cfg.g)
             area = trapezoid(lineshape, R)
 
         if self.baseline_cfg.enabled:

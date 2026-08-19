@@ -17,10 +17,10 @@ import numpy as np
 import yaml
 
 _DATA_DIR = Path(__file__).resolve().parent
-DULYA_FITS_YAML = _DATA_DIR / "fitting" / "dulya_fits_single_period.yaml"
-BASELINE_FITS_YAML = _DATA_DIR / "fitting" / "baseline_fits_single_event.yaml"
-DULYA_STATS_YAML = _DATA_DIR / "fitting" / "dulya_fit_stats_single_period.yaml"
-BASELINE_STATS_YAML = _DATA_DIR / "fitting" / "baseline_fit_stats_single_event.yaml"
+DULYA_FITS_YAML = _DATA_DIR / "dulya_fits_single_period.yaml"
+BASELINE_FITS_YAML = _DATA_DIR / "baseline_fits_single_event.yaml"
+DULYA_STATS_YAML = _DATA_DIR / "dulya_fit_stats_single_period.yaml"
+BASELINE_STATS_YAML = _DATA_DIR / "baseline_fit_stats_single_event.yaml"
 
 RGC_FREQ_MIN_MHZ = 32.3
 RGC_FREQ_MAX_MHZ = 33.1
@@ -100,7 +100,7 @@ def _fallback_dulya_ranges() -> Dict[str, Tuple[float, float]]:
     if "scaling_factor" in ranges and "cc" not in ranges:
         ranges["cc"] = ranges.pop("scaling_factor")
     if "cc" not in ranges:
-        ranges["cc"] = (-1.39, -1.39)
+        ranges["cc"] = (1.39, 1.39)
     ranges.setdefault("center_mhz", (CENTER_MHZ, CENTER_MHZ))
     return {key: ranges[key] for key in DULYA_SAMPLE_KEYS if key in ranges}
 
@@ -128,7 +128,7 @@ def _events_from_fit_yaml(path: Path) -> Dict[int, dict]:
 
 def _dulya_event_to_params(event: dict) -> dict[str, float]:
     params = event["params"]
-    cc = float(event.get("cc", params.get("scaling_factor", -1.39)))
+    cc = float(event.get("cc", params.get("scaling_factor", 1.39)))
     return {
         "P": float(params["P"]),
         "cc": cc,
