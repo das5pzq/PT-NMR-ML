@@ -1,23 +1,25 @@
 #!/bin/bash
-#SBATCH -p parition_name
+#SBATCH -p standard
 #SBATCH --job-name=rgc_data_generation
 #SBATCH --output=job_logs/rgc_job_%A_%a.out
 #SBATCH --error=job_logs/rgc_job_%A_%a.err
 #SBATCH -c 8
-#SBATCH --mem=8G
+#SBATCH --mem=32G
 #SBATCH -t 1:00:00
 #SBATCH -A account_name
-#SBATCH --array=1-200     # Parallel jobs; total samples = NUM_SAMPLES * array_size
+#SBATCH --array=1-100     # Parallel jobs; total samples = NUM_SAMPLES * array_size
 
 set -euo pipefail
 
 # ===== Global Configuration =====
 # Submit from the RGC project directory (scripts live here).
-OUTPUT_DIR="Training_Data_RGC"
-OUTPUT_FILENAME="Training_Data_RGC_200K.parquet"
-NUM_SAMPLES=1000                       # Samples per task; TOTAL = NUM_SAMPLES * SLURM_ARRAY_TASK_MAX
+OUTPUT_DIR="Training_Data_RGC_17_34"
+OUTPUT_FILENAME="Training_Data_RGC_17_34_500K.parquet"
+NUM_SAMPLES=30000                       # Samples per task; TOTAL = NUM_SAMPLES * SLURM_ARRAY_TASK_MAX
 ADD_NOISE=1                           # 0=no noise, 1=add noise
 NOISE_LEVEL=0.000027                  # Gaussian noise std (RGC wing scale)
+P_MIN=-0.34
+P_MAX=-0.16
 
 mkdir -p job_logs
 
@@ -29,18 +31,32 @@ echo "Output filename: ${OUTPUT_FILENAME}"
 echo "Samples per job: ${NUM_SAMPLES}"
 echo "Add noise: ${ADD_NOISE}"
 echo "Noise level: ${NOISE_LEVEL}"
+echo "P Upper Bound: ${P_MAX}"
+echo "P Lower Bound: ${P_MIN}"
 
+module purge
+module load apptainer pytorch/2.9.0
+
+if [[ -z "${CONTAINERDIR:-}" ]]; then
+  echo "CONTAINERDIR is unset after loading pytorch module" >&2
+  exit 1
+fi
+
+SIF="${CONTAINERDIR}/pytorch-2.9.0.sif"
+echo "Container: ${SIF}"
 
 mkdir -p "${OUTPUT_DIR}"
 chmod 755 "${OUTPUT_DIR}"
 
 echo "Generating RGC signal data..."
-python Create_Training_Data_RGC.py \
+apptainer run "${SIF}" Create_Training_Data_RGC.py \
     --job_id "${SLURM_ARRAY_TASK_ID}" \
     --num_samples "${NUM_SAMPLES}" \
     --add_noise "${ADD_NOISE}" \
     --noise_level "${NOISE_LEVEL}" \
-    --output_dir "${OUTPUT_DIR}"
+    --output_dir "${OUTPUT_DIR}" \
+    --p_min "${P_MIN}" \
+    --p_max "${P_MAX}"
 
 echo "Signal generation complete for task ${SLURM_ARRAY_TASK_ID}"
 
@@ -96,11 +112,20 @@ if [ "${SLURM_ARRAY_TASK_ID}" -eq "1" ]; then
 #SBATCH -c 8
 #SBATCH --mem=32G
 #SBATCH -t 2:00:00
-#SBATCH -A localhost
+#SBATCH -A spinquest_standard
 
 set -euo pipefail
 
-python merge.py "${OUTPUT_DIR}" "${OUTPUT_FILENAME}" "Sample_*.parquet"
+module purge
+module load apptainer pytorch/2.9.0
+
+if [[ -z "\${CONTAINERDIR:-}" ]]; then
+  echo "CONTAINERDIR is unset after loading pytorch module" >&2
+  exit 1
+fi
+
+apptainer run "\${CONTAINERDIR}/pytorch-2.9.0.sif" merge.py \\
+  "${OUTPUT_DIR}" "${OUTPUT_FILENAME}" "Sample_*.parquet"
 EOF
 
     sbatch --dependency=afterok:${SLURM_ARRAY_JOB_ID} "${MERGE_SCRIPT}"
