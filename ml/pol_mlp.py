@@ -75,6 +75,7 @@ class FFLightningModule(LightningModule):
         hidden_dim=256,
         learning_rate=1e-3,
         max_epochs=500,
+        huber_delta=0.01,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -82,7 +83,7 @@ class FFLightningModule(LightningModule):
             input_dim,
             hidden_dim,
         )
-        self.criterion = nn.MSELoss()
+        self.criterion = nn.HuberLoss(delta=huber_delta)
         self.learning_rate = learning_rate
         self.max_epochs = max_epochs
 
@@ -137,6 +138,7 @@ def _load_or_create_model(
     hidden_dim,
     learning_rate,
     max_epochs,
+    huber_delta=0.01,
 ):
 
     ckpt_path = os.path.join(model_dir, "best_model_checkpoint.ckpt")
@@ -148,6 +150,7 @@ def _load_or_create_model(
             hidden_dim=hidden_dim,
             learning_rate=learning_rate,
             max_epochs=max_epochs,
+            huber_delta=huber_delta,
         ), None
 
     print(f"Resuming from {ckpt_path})")
@@ -228,7 +231,7 @@ class SetLearningRateCallback(Callback):
 def train_model(X_train, y_train, X_val, y_val, X_test, y_test,
                 model_dir, performance_dir, version,
                 num_workers=4, learning_rate=1e-3, max_epochs=500,
-                hidden_dim=256, batch_size=256
+                hidden_dim=256, batch_size=256, huber_delta=0.01,
                 ):
 
     pin = torch.cuda.is_available()
@@ -262,6 +265,7 @@ def train_model(X_train, y_train, X_val, y_val, X_test, y_test,
         hidden_dim,
         learning_rate,
         max_epochs,
+        huber_delta,
     )
 
     callbacks = [

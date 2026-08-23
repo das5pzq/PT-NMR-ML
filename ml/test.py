@@ -201,8 +201,10 @@ def main() -> None:
     df = pd.read_parquet(args.data)
     signal_cols = df.columns[0:512]
     X_raw = df[signal_cols].values.astype("float32")
-    has_p = "P" in df.columns
-    y_true = df["P"].values.astype("float32") if has_p else None
+    target_names = [name for name in ("P", "Q") if name in df.columns]
+    y_true = (
+        df[target_names].values.astype("float32") if target_names else None
+    )
     snr = df["SNR"].values.astype("float32") if "SNR" in df.columns else None
     n_samples = len(df)
     print(f"Loaded {n_samples} samples")
@@ -251,38 +253,52 @@ def main() -> None:
         torch.mps.synchronize()
     elapsed = time.perf_counter() - t0
 
-    y_pred = torch.cat(predictions, dim=0).numpy().reshape(-1)
+    # Model returns [P, Q] per sample — keep (n, 2), do not flatten.
+    y_pred = torch.cat(predictions, dim=0).numpy()
+    if y_pred.ndim == 1:
+        y_pred = y_pred.reshape(-1, 1)
 
     print("\n" + "=" * 60)
     print(f"Prediction time: {elapsed:.6f} s  ({n_samples / elapsed:.1f} samples/s)")
     print("=" * 60)
 
     y_pred_pct = y_pred * 100.0
-    out = {"Predicted": y_pred_pct}
+    pred_names = ("P", "Q")[: y_pred_pct.shape[1]]
+    out: dict[str, np.ndarray] = {
+        f"Predicted_{name}": y_pred_pct[:, idx]
+        for idx, name in enumerate(pred_names)
+    }
+
     if y_true is not None:
         y_true_pct = y_true * 100.0
-        residuals = y_true_pct - y_pred_pct
-        rpe = np.abs(y_pred_pct - y_true_pct) / y_true_pct * 100.0
-        mse = float(np.mean((y_true_pct - y_pred_pct) ** 2))
-        mae = float(np.mean(np.abs(y_true_pct - y_pred_pct)))
-        rmse = float(np.sqrt(mse))
-        print(f"\nTest metrics (polarization %):")
-        print(f"  MSE:      {mse:.6f}")
-        print(f"  MAE:      {mae:.6f}")
-        print(f"  RMSE:     {rmse:.6f}")
-        print(f"  Mean RPE: {rpe.mean():.5f}%")
+        for idx, name in enumerate(target_names):
+            if idx >= y_pred_pct.shape[1]:
+                break
+            y_t = y_true_pct[:, idx]
+            y_h = y_pred_pct[:, idx]
+            residuals = y_t - y_h
+            rpe = np.abs(y_h - y_t) / np.abs(y_t) * 100.0
+            mse = float(np.mean((y_t - y_h) ** 2))
+            mae = float(np.mean(np.abs(y_t - y_h)))
+            rmse = float(np.sqrt(mse))
+            print(f"\nTest metrics ({name} %):")
+            print(f"  MSE:      {mse:.6f}")
+            print(f"  MAE:      {mae:.6f}")
+            print(f"  RMSE:     {rmse:.6f}")
+            print(f"  Mean RPE: {rpe.mean():.5f}%")
 
-        range_stats = polarization_range_stats(y_true_pct, residuals, rpe)
-        print_polarization_range_stats(range_stats)
-        range_stats_path = f"{performance_dir}/{version}_test_range_stats.csv"
-        range_stats.to_csv(range_stats_path, index=False)
-        print(f"\nSaved range statistics to {range_stats_path}")
+            out[f"Actual_{name}"] = y_t
+            out[f"Residuals_{name}"] = residuals
+            out[f"RPE_{name}"] = rpe
 
-        out.update({
-            "Actual": y_true_pct,
-            "Residuals": residuals,
-            "RPE": rpe,
-        })
+            # Polarization-range breakdown is only meaningful for P.
+            if name == "P":
+                range_stats = polarization_range_stats(y_t, residuals, rpe)
+                print_polarization_range_stats(range_stats)
+                range_stats_path = f"{performance_dir}/{version}_test_range_stats.csv"
+                range_stats.to_csv(range_stats_path, index=False)
+                print(f"\nSaved range statistics to {range_stats_path}")
+
     if snr is not None:
         out["SNR"] = snr
 
