@@ -20,17 +20,18 @@ PATH = "data-test"
 OUT_YAML = "fitting/baseline_fits_single_event.yaml"
 OUT_STATS_YAML = "fitting/baseline_fit_stats_single_event.yaml"
 OUT_STATS_DIR = "fitting/baseline_fit_stats_single_event"
-VOLTAGE_KEY = "phase"
+VOLTAGE_KEY = "baseline"
 SPECIES = "deuteron"
 
-EDGE_FRACTION = 0.25  # outer fraction of bins on each side, matching fit-dulya
-POLYNOMIAL_DEGREE = 2  # sets minimum wing size via wing_mask
+# When enabled, only REFERENCE_EVENT_INDEX is fit; every other event reuses that
+# parameter vector (baseline is treated as constant within a file/period).
+REUSE_REFERENCE_FIT_FOR_ALL_EVENTS = True
 
-# When enabled, event REFERENCE_EVENT_INDEX is fully fit; later events keep its
-# circuit parameters fixed while U, Cknob, eta, trim, Cstray, phi_const, and
-# DC_offset remain free.
+# When REUSE is off and this is on: event REFERENCE_EVENT_INDEX is fully fit;
+# later events keep its circuit parameters fixed while U, Cknob, eta, trim,
+# Cstray, phi_const, and DC_offset remain free.
 FIX_CIRCUIT_PARAMS_FROM_REFERENCE = True
-REFERENCE_EVENT_INDEX = 0  # 0-based index (event 1 in 1-based numbering)
+REFERENCE_EVENT_INDEX = 10  # 0-based index (event 1 in 1-based numbering)
 
 FIT_PARAM_NAMES = (
     "U",
@@ -41,6 +42,18 @@ FIT_PARAM_NAMES = (
     "phi_const",
     "DC_offset",
 )
+# Optimizer bounds for the free knobs only; circuit params stay unbounded.
+# Leave disabled: even mild caps (e.g. U<=5) pin the fit at p0 and ruin the match.
+USE_FIT_BOUNDS = False
+FIT_BOUNDS: dict[str, tuple[float, float]] = {
+    "U": (0.0, 100.0),
+    "Cknob": (0.0, 1.0),
+    "eta": (1e-6, 0.1),
+    "trim": (-5.0, 5.0),
+    "Cstray": (-1e-10, 1e-10),
+    "phi_const": (-4.0 * np.pi, 4.0 * np.pi),
+    "DC_offset": (-50.0, 50.0),
+}
 CIRCUIT_PARAM_NAMES = (
     "L0",
     "Rcoil",
@@ -97,15 +110,7 @@ def load_records(path: str) -> list[dict]:
         return [json.loads(line) for line in f if line.strip()]
 
 
-def wing_mask(n_bins: int) -> np.ndarray:
-    n_edge = max(POLYNOMIAL_DEGREE + 1, int(n_bins * EDGE_FRACTION))
-    mask = np.zeros(n_bins, dtype=bool)
-    mask[:n_edge] = True
-    mask[-n_edge:] = True
-    return mask
-
-
-def _default_fit_p0(baseline_wings: np.ndarray) -> dict[str, float]:
+def _default_fit_p0(baseline: np.ndarray) -> dict[str, float]:
     return {
         "U": 5.0,
         "Cknob": 0.404,
@@ -113,7 +118,7 @@ def _default_fit_p0(baseline_wings: np.ndarray) -> dict[str, float]:
         "trim": 0.5,
         "Cstray": 1e-20,
         "phi_const": 0.0,
-        "DC_offset": float(np.mean(baseline_wings)),
+        "DC_offset": float(np.mean(baseline)),
     }
 
 
@@ -129,29 +134,62 @@ def _assemble_params(
     )
 
 
+def _curve_fit_bounds(param_names: tuple[str, ...]) -> tuple[list[float], list[float]]:
+    lower: list[float] = []
+    upper: list[float] = []
+    for name in param_names:
+        if name in FIT_BOUNDS:
+            lo, hi = FIT_BOUNDS[name]
+            lower.append(float(lo))
+            upper.append(float(hi))
+        else:
+            lower.append(-np.inf)
+            upper.append(np.inf)
+    return lower, upper
+
+
+def _clip_to_bounds(values: dict[str, float]) -> dict[str, float]:
+    clipped: dict[str, float] = {}
+    for name, value in values.items():
+        if name in FIT_BOUNDS:
+            lo, hi = FIT_BOUNDS[name]
+            clipped[name] = float(np.clip(value, lo, hi))
+        else:
+            clipped[name] = float(value)
+    return clipped
+
+
 def fit_baseline(
     freq_mhz: np.ndarray,
     baseline: np.ndarray,
-    mask: np.ndarray,
     fixed_circuit_params: dict[str, float] | None = None,
     fit_p0: dict[str, float] | None = None,
 ) -> tuple[np.ndarray, float, float]:
-    """Fit Q-meter baseline to wing bins only. Returns ``(params, nrmse, rmse)``.
+    """Fit Q-meter ``Baseline`` to the full spectrum. Returns ``(params, nrmse, rmse)``.
 
-    NRMSE = RMSE / peak |baseline| on the wing region.
+    NRMSE = RMSE / peak |baseline|.
 
     If ``fixed_circuit_params`` is set, the circuit pack is held at the supplied
     values while ``FIT_PARAM_NAMES`` are optimized.
     """
-    freq_wings = freq_mhz[mask]
-    baseline_wings = baseline[mask]
-
-    default_fit_p0 = _default_fit_p0(baseline_wings)
+    default_fit_p0 = (
+        _clip_to_bounds(_default_fit_p0(baseline))
+        if USE_FIT_BOUNDS
+        else _default_fit_p0(baseline)
+    )
     p0 = tuple(default_fit_p0[name] for name in FIT_PARAM_NAMES) + DEFAULT_CIRC_CONSTS
 
     fit_kwargs: dict = {"maxfev": 500000}
+    if USE_FIT_BOUNDS:
+        fit_kwargs["bounds"] = _curve_fit_bounds(
+            FIT_PARAM_NAMES if fixed_circuit_params is not None else PARAM_NAMES
+        )
+
     if fixed_circuit_params is not None:
-        start = fit_p0 if fit_p0 is not None else default_fit_p0
+        if fit_p0 is not None:
+            start = _clip_to_bounds(fit_p0) if USE_FIT_BOUNDS else fit_p0
+        else:
+            start = default_fit_p0
 
         def model_free(
             f: np.ndarray,
@@ -177,8 +215,8 @@ def fit_baseline(
         free_p0 = tuple(start[name] for name in FIT_PARAM_NAMES)
         free_fit, _ = curve_fit(
             model_free,
-            freq_wings,
-            baseline_wings,
+            freq_mhz,
+            baseline,
             p0=free_p0,
             **fit_kwargs,
         )
@@ -187,17 +225,25 @@ def fit_baseline(
     else:
         params, _ = curve_fit(
             baseline_fit,
-            freq_wings,
-            baseline_wings,
+            freq_mhz,
+            baseline,
             p0=p0,
             **fit_kwargs,
         )
-    fitted_wings = baseline_fit(freq_wings, *params)
-    residual = baseline_wings - fitted_wings
+    return params, *_fit_errors(freq_mhz, baseline, params)
+
+
+def _fit_errors(
+    freq_mhz: np.ndarray,
+    baseline: np.ndarray,
+    params: np.ndarray,
+) -> tuple[float, float]:
+    """NRMSE and RMSE of ``params`` over the full spectrum."""
+    residual = baseline - baseline_fit(freq_mhz, *params)
     rmse = float(np.sqrt(np.mean(residual**2)))
-    peak_amp = float(np.max(np.abs(baseline_wings)))
+    peak_amp = float(np.max(np.abs(baseline)))
     nrmse = float(rmse / peak_amp) if peak_amp > 0.0 else float("inf")
-    return params, nrmse, rmse
+    return nrmse, rmse
 
 
 def _percentile_stats(values: np.ndarray) -> dict[str, float]:
@@ -241,7 +287,10 @@ def summarize_fits(results: dict[str, dict], n_fitted: int, n_skipped: int) -> d
         "n_files": len(results),
         "n_events_fitted": n_fitted,
         "n_events_skipped": n_skipped,
-        "fix_circuit_params_from_reference": FIX_CIRCUIT_PARAMS_FROM_REFERENCE,
+        "reuse_reference_fit_for_all_events": REUSE_REFERENCE_FIT_FOR_ALL_EVENTS,
+        "fix_circuit_params_from_reference": (
+            False if REUSE_REFERENCE_FIT_FOR_ALL_EVENTS else FIX_CIRCUIT_PARAMS_FROM_REFERENCE
+        ),
         "reference_event_index": REFERENCE_EVENT_INDEX,
         "fixed_circuit_params": list(CIRCUIT_PARAM_NAMES),
         "free_fit_params": list(FIT_PARAM_NAMES),
@@ -261,8 +310,13 @@ def summarize_fits(results: dict[str, dict], n_fitted: int, n_skipped: int) -> d
 
 def print_summary(summary: dict) -> None:
     print("\n=== Baseline fit summary ===")
-    if summary.get("fix_circuit_params_from_reference"):
-        ref_idx = summary.get("reference_event_index", REFERENCE_EVENT_INDEX)
+    ref_idx = summary.get("reference_event_index", REFERENCE_EVENT_INDEX)
+    if summary.get("reuse_reference_fit_for_all_events"):
+        print(
+            f"mode:    reuse full fit from event {ref_idx} "
+            f"(1-based event {ref_idx + 1}) for all events in each file"
+        )
+    elif summary.get("fix_circuit_params_from_reference"):
         print(
             f"mode:    fixed circuit params from event {ref_idx} "
             f"(1-based event {ref_idx + 1}); fit {', '.join(FIT_PARAM_NAMES)}"
@@ -370,13 +424,10 @@ def plot_example_fits(
         records = load_records(str(data_dir / row["filename"]))
         freq_mhz = np.asarray(records[0]["freq_list"], dtype=np.float64)
         signal = np.asarray(records[row["event_id"]][VOLTAGE_KEY], dtype=np.float64)
-        mask = wing_mask(len(freq_mhz))
         params = np.asarray([row[name] for name in PARAM_NAMES], dtype=np.float64)
         fitted = baseline_fit(freq_mhz, *params)
         residual = signal - fitted
 
-        ax.axvspan(freq_mhz[0], freq_mhz[mask][0], color="0.85", alpha=0.5)
-        ax.axvspan(freq_mhz[mask][-1], freq_mhz[-1], color="0.85", alpha=0.5)
         ax.plot(freq_mhz, signal, color="0.35", lw=0.8, label="data")
         ax.plot(freq_mhz, fitted, color="darkorange", lw=1.4, ls="--", label="fit")
         ax.set_ylabel("V")
@@ -421,10 +472,10 @@ def main() -> None:
         if freq_mhz.ndim != 1 or len(freq_mhz) == 0:
             continue
 
-        mask = wing_mask(len(freq_mhz))
         file_events: dict[int, dict] = {}
         reference_circuit_params: dict[str, float] | None = None
         reference_fit_p0: dict[str, float] | None = None
+        shared_params: np.ndarray | None = None
 
         for index, record in tqdm(enumerate(records), desc="Events", leave=False):
             if VOLTAGE_KEY not in record:
@@ -436,38 +487,57 @@ def main() -> None:
                 n_skipped += 1
                 continue
 
-            fixed_circuit_params = None
-            fit_p0 = None
-            if FIX_CIRCUIT_PARAMS_FROM_REFERENCE:
+            if REUSE_REFERENCE_FIT_FOR_ALL_EVENTS:
                 if index == REFERENCE_EVENT_INDEX:
-                    fixed_circuit_params = None
-                elif reference_circuit_params is not None:
-                    fixed_circuit_params = reference_circuit_params
-                    fit_p0 = reference_fit_p0
+                    try:
+                        shared_params, nrmse, rmse = fit_baseline(
+                            freq_mhz, signal
+                        )
+                    except Exception:
+                        n_skipped += 1
+                        continue
+                    params = shared_params
+                elif shared_params is not None:
+                    params = shared_params
+                    nrmse, rmse = _fit_errors(freq_mhz, signal, params)
                 else:
                     n_skipped += 1
                     continue
+            else:
+                fixed_circuit_params = None
+                fit_p0 = None
+                if FIX_CIRCUIT_PARAMS_FROM_REFERENCE:
+                    if index == REFERENCE_EVENT_INDEX:
+                        fixed_circuit_params = None
+                    elif reference_circuit_params is not None:
+                        fixed_circuit_params = reference_circuit_params
+                        fit_p0 = reference_fit_p0
+                    else:
+                        n_skipped += 1
+                        continue
 
-            try:
-                params, nrmse, rmse = fit_baseline(
-                    freq_mhz,
-                    signal,
-                    mask,
-                    fixed_circuit_params=fixed_circuit_params,
-                    fit_p0=fit_p0,
-                )
-            except Exception:
-                n_skipped += 1
-                continue
+                try:
+                    params, nrmse, rmse = fit_baseline(
+                        freq_mhz,
+                        signal,
+                        fixed_circuit_params=fixed_circuit_params,
+                        fit_p0=fit_p0,
+                    )
+                except Exception:
+                    n_skipped += 1
+                    continue
 
-            if FIX_CIRCUIT_PARAMS_FROM_REFERENCE and index == REFERENCE_EVENT_INDEX:
-                param_dict = {
-                    name: float(value) for name, value in zip(PARAM_NAMES, params, strict=True)
-                }
-                reference_circuit_params = {
-                    name: param_dict[name] for name in CIRCUIT_PARAM_NAMES
-                }
-                reference_fit_p0 = {name: param_dict[name] for name in FIT_PARAM_NAMES}
+                if FIX_CIRCUIT_PARAMS_FROM_REFERENCE and index == REFERENCE_EVENT_INDEX:
+                    param_dict = {
+                        name: float(value)
+                        for name, value in zip(PARAM_NAMES, params, strict=True)
+                    }
+                    reference_circuit_params = {
+                        name: param_dict[name] for name in CIRCUIT_PARAM_NAMES
+                    }
+                    reference_fit_p0 = {
+                        name: param_dict[name] for name in FIT_PARAM_NAMES
+                    }
 
             file_events[index] = {
                 "nrmse": nrmse,
@@ -482,7 +552,6 @@ def main() -> None:
             results[filename] = {
                 "species": SPECIES,
                 "n_bins": int(len(freq_mhz)),
-                "n_wing_bins": int(np.count_nonzero(mask)),
                 "freq_min_mhz": float(freq_mhz[0]),
                 "freq_max_mhz": float(freq_mhz[-1]),
                 "n_events_fitted": len(file_events),
