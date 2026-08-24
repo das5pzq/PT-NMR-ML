@@ -24,8 +24,8 @@ device = torch.device('cuda')
 
 
 if __name__ == "__main__":
-    data_path = "data/Training_Data_RGC_17_34_1M.parquet"
-    version = 'Training_Data_RGC_17_34_1M_V3'
+    data_path = "data/Training_Data_RGC_17_34_500K.parquet"
+    version = 'Training_Data_RGC_17_34_500K_V3'
     performance_dir = f"Model_Performance/{version}"
     model_dir = f"Models/{version}"
     os.makedirs(performance_dir, exist_ok=True)
@@ -77,9 +77,9 @@ if __name__ == "__main__":
     num_workers  = 13
     learning_rate = 3e-4
     max_epochs   = 500
-    hidden_dim   = 256
+    hidden_dim   = 512
     batch_size   = 256
-    huber_delta  = 0.001
+    weight_decay = 1e-5
 
     print("\n" + "=" * 60)
     print("Training MLP Model")
@@ -93,7 +93,7 @@ if __name__ == "__main__":
         max_epochs=max_epochs,
         hidden_dim=hidden_dim,
         batch_size=batch_size,
-        huber_delta=huber_delta,
+        weight_decay=weight_decay,
     )
 
     print("\n" + "=" * 60)

@@ -135,7 +135,9 @@ def load_model(model_path: str, device: torch.device) -> torch.nn.Module:
         model.load_state_dict(state)
     else:
         state = torch.load(model_path, map_location=device, weights_only=True)
-        if "input_proj.weight" in state:
+        if "trunk.0.weight" in state:
+            hidden_dim, input_dim = state["trunk.0.weight"].shape
+        elif "input_proj.weight" in state:
             hidden_dim, input_dim = state["input_proj.weight"].shape
         else:
             hidden_dim, input_dim = state["net.0.weight"].shape

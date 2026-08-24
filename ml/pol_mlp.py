@@ -51,20 +51,29 @@ class NMRDataset(Dataset):
         return self.X[idx], self.y[idx]
 
 class SimpleFeedForward(nn.Module):
+    """Shared trunk (2 hidden layers + LayerNorm) with separate P/Q heads."""
+
     def __init__(
         self,
         input_dim,
         hidden_dim=256,
     ):
         super().__init__()
-        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        self.trunk = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+        )
         self.p_head = nn.Linear(hidden_dim, 1)
         self.q_head = nn.Linear(hidden_dim, 1)
 
     def forward(self, x):
-        h = F.relu(self.input_proj(x))
+        h = self.trunk(x)
         p = self.p_head(h)
-        q = self.q_head(h.detach())
+        q = self.q_head(h)
         return torch.cat([p, q], dim=-1)
 
 
@@ -75,7 +84,7 @@ class FFLightningModule(LightningModule):
         hidden_dim=256,
         learning_rate=1e-3,
         max_epochs=500,
-        huber_delta=0.01,
+        weight_decay=1e-5,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -83,9 +92,11 @@ class FFLightningModule(LightningModule):
             input_dim,
             hidden_dim,
         )
-        self.criterion = nn.HuberLoss(delta=huber_delta)
+        # L1 directly optimizes MAE; Huber with small delta was mostly quadratic.
+        self.criterion = nn.L1Loss()
         self.learning_rate = learning_rate
         self.max_epochs = max_epochs
+        self.weight_decay = weight_decay
 
     def forward(self, x):
         return self.model(x)
@@ -100,36 +111,46 @@ class FFLightningModule(LightningModule):
         x, y = batch
         y_hat = self(x)
         loss, loss_p, loss_q = self._split_losses(y_hat, y)
+        mae = F.l1_loss(y_hat, y)
         self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log('train_loss_p', loss_p, on_step=False, on_epoch=True)
         self.log('train_loss_q', loss_q, on_step=False, on_epoch=True)
-        self.log('train_mae', F.l1_loss(y_hat, y), on_step=False, on_epoch=True, prog_bar=True)
+        self.log('train_mae', mae, on_step=False, on_epoch=True, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         x, y = batch
         y_hat = self(x)
         loss, loss_p, loss_q = self._split_losses(y_hat, y)
+        mae = F.l1_loss(y_hat, y)
         self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log('val_loss_p', loss_p, on_step=False, on_epoch=True)
         self.log('val_loss_q', loss_q, on_step=False, on_epoch=True)
-        self.log('val_mae', F.l1_loss(y_hat, y), on_step=False, on_epoch=True, prog_bar=True)
+        self.log('val_mae', mae, on_step=False, on_epoch=True, prog_bar=True)
 
     def test_step(self, batch, batch_idx):
         x, y = batch
         y_hat = self(x)
         loss, loss_p, loss_q = self._split_losses(y_hat, y)
+        mae = F.l1_loss(y_hat, y)
         self.log('test_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log('test_loss_p', loss_p, on_step=False, on_epoch=True)
         self.log('test_loss_q', loss_q, on_step=False, on_epoch=True)
-        self.log('test_mae', F.l1_loss(y_hat, y), on_step=False, on_epoch=True, prog_bar=True)
+        self.log('test_mae', mae, on_step=False, on_epoch=True, prog_bar=True)
 
     def configure_optimizers(self):
-        optimizer = optim.AdamW(self.parameters(), lr=self.learning_rate)
+        optimizer = optim.AdamW(
+            self.parameters(),
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay,
+        )
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=self.max_epochs, eta_min=1e-7
         )
-        return {'optimizer': optimizer, 'lr_scheduler': {'scheduler': scheduler, 'monitor': 'val_loss'}}
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {'scheduler': scheduler, 'interval': 'epoch'},
+        }
 
 
 def _load_or_create_model(
@@ -138,7 +159,7 @@ def _load_or_create_model(
     hidden_dim,
     learning_rate,
     max_epochs,
-    huber_delta=0.01,
+    weight_decay=1e-5,
 ):
 
     ckpt_path = os.path.join(model_dir, "best_model_checkpoint.ckpt")
@@ -150,7 +171,7 @@ def _load_or_create_model(
             hidden_dim=hidden_dim,
             learning_rate=learning_rate,
             max_epochs=max_epochs,
-            huber_delta=huber_delta,
+            weight_decay=weight_decay,
         ), None
 
     print(f"Resuming from {ckpt_path})")
@@ -162,6 +183,7 @@ def _load_or_create_model(
     )
     model.learning_rate = learning_rate
     model.max_epochs = max_epochs
+    model.weight_decay = weight_decay
 
     return model, ckpt_path
 
@@ -231,7 +253,7 @@ class SetLearningRateCallback(Callback):
 def train_model(X_train, y_train, X_val, y_val, X_test, y_test,
                 model_dir, performance_dir, version,
                 num_workers=4, learning_rate=1e-3, max_epochs=500,
-                hidden_dim=256, batch_size=256, huber_delta=0.01,
+                hidden_dim=256, batch_size=256, weight_decay=1e-5,
                 ):
 
     pin = torch.cuda.is_available()
@@ -265,14 +287,14 @@ def train_model(X_train, y_train, X_val, y_val, X_test, y_test,
         hidden_dim,
         learning_rate,
         max_epochs,
-        huber_delta,
+        weight_decay,
     )
 
     callbacks = [
         ModelCheckpoint(
             dirpath=model_dir,
             filename='best_model_checkpoint',
-            monitor='val_loss',
+            monitor='val_mae',
             save_top_k=1,
             mode='min',
             save_last=True,
