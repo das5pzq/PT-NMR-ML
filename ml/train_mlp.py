@@ -74,7 +74,6 @@ if __name__ == "__main__":
     if torch.backends.mps.is_available():
         torch.mps.empty_cache()
 
-    num_workers  = 13
     learning_rate = 3e-4
     max_epochs   = 500
     hidden_dim   = 512
@@ -88,7 +87,6 @@ if __name__ == "__main__":
     model, trainer = train_model(
         X_train, y_train, X_val, y_val, X_test, y_test,
         model_dir, performance_dir, version,
-        num_workers=num_workers,
         learning_rate=learning_rate,
         max_epochs=max_epochs,
         hidden_dim=hidden_dim,
@@ -101,8 +99,7 @@ if __name__ == "__main__":
     print("=" * 60)
 
     test_loader = DataLoader(NMRDataset(X_test, y_test), batch_size=batch_size, shuffle=False,
-                             num_workers=num_workers, pin_memory=torch.cuda.is_available(),
-                             persistent_workers=True)
+                             pin_memory=torch.cuda.is_available())
 
     model.eval()
     predictions = []

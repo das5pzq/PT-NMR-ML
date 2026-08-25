@@ -252,7 +252,7 @@ class SetLearningRateCallback(Callback):
 
 def train_model(X_train, y_train, X_val, y_val, X_test, y_test,
                 model_dir, performance_dir, version,
-                num_workers=4, learning_rate=1e-3, max_epochs=500,
+                learning_rate=1e-3, max_epochs=500,
                 hidden_dim=256, batch_size=256, weight_decay=1e-5,
                 ):
 
@@ -260,21 +260,15 @@ def train_model(X_train, y_train, X_val, y_val, X_test, y_test,
 
     train_loader = DataLoader(
         NMRDataset(X_train, y_train),
-        batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=pin,
-        persistent_workers=num_workers > 0,
+        batch_size=batch_size, shuffle=True, pin_memory=pin,
     )
     val_loader = DataLoader(
         NMRDataset(X_val, y_val),
-        batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=pin,
-        persistent_workers=num_workers > 0,
+        batch_size=batch_size, shuffle=False, pin_memory=pin,
     )
     test_loader = DataLoader(
         NMRDataset(X_test, y_test),
-        batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=pin,
-        persistent_workers=num_workers > 0,
+        batch_size=batch_size, shuffle=False, pin_memory=pin,
     )
 
     input_dim = X_train.shape[1]
