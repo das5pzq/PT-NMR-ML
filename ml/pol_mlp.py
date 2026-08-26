@@ -6,20 +6,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor, Callback
 from lightning.pytorch.loggers import CSVLogger
 from lightning.pytorch import Trainer
 from lightning.pytorch.core import LightningModule
 import matplotlib.pyplot as plt
 import random
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
-import pickle
-import json
 import warnings
 warnings.filterwarnings('ignore')
-import gc
 import sys
 
 sys.stdout.flush()
@@ -51,8 +45,6 @@ class NMRDataset(Dataset):
         return self.X[idx], self.y[idx]
 
 class SimpleFeedForward(nn.Module):
-    """Shared trunk (2 hidden layers + LayerNorm) with separate P/Q heads."""
-
     def __init__(
         self,
         input_dim,
@@ -92,7 +84,6 @@ class FFLightningModule(LightningModule):
             input_dim,
             hidden_dim,
         )
-        # L1 directly optimizes MAE; Huber with small delta was mostly quadratic.
         self.criterion = nn.L1Loss()
         self.learning_rate = learning_rate
         self.max_epochs = max_epochs

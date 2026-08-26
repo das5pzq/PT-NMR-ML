@@ -21,8 +21,8 @@ warnings.filterwarnings('ignore')
 import gc
 import sys
 
-POLARIZATION_RANGE = "LOW_POL"  # Options: HIGH_POL (2% - 60), LOW_POL (TE - 2%)
-USE_SE_BLOCK = POLARIZATION_RANGE == "LOW_POL"
+POLARIZATION_RANGE = "HIGH_POL"  # Options: HIGH_POL (2% - 60), LOW_POL (TE - 2%)
+USE_SE_BLOCK = POLARIZATION_RANGE == "HIGH_POL"
 
 sys.stdout.flush()
 
@@ -322,11 +322,10 @@ class LossHistoryCallback(Callback):
 
 
 def train_model(X_train, y_train, X_val, y_val, X_test, y_test, 
-                model_dir, performance_dir, version, num_workers=4, 
+                model_dir, performance_dir, version, 
                 learning_rate=1e-3, max_epochs=2000, input_length=190, batch_size=256):
     
     pin_memory = torch.cuda.is_available()
-    persistent_workers = num_workers > 0
 
     train_dataset = NMRDataset(X_train, y_train)
     val_dataset = NMRDataset(X_val, y_val)
@@ -336,25 +335,19 @@ def train_model(X_train, y_train, X_val, y_val, X_test, y_test,
         train_dataset, 
         batch_size=batch_size, 
         shuffle=True, 
-        num_workers=num_workers, 
         pin_memory=pin_memory, 
-        persistent_workers=persistent_workers,
     )
     val_loader = DataLoader(
         val_dataset, 
         batch_size=batch_size, 
         shuffle=False, 
-        num_workers=num_workers, 
         pin_memory=pin_memory, 
-        persistent_workers=persistent_workers,
     )
     test_loader = DataLoader(
         test_dataset, 
         batch_size=batch_size, 
         shuffle=False, 
-        num_workers=num_workers, 
         pin_memory=pin_memory, 
-        persistent_workers=persistent_workers,
     )
     
     checkpoint_path = f"{model_dir}/best_model_checkpoint.ckpt"
@@ -431,15 +424,15 @@ def main():
     print(f"Using device: {device} (Lightning accelerator={ACCELERATOR})")
     print(f"Polarization range: {POLARIZATION_RANGE} (SE block {'on' if USE_SE_BLOCK else 'off'})")
 
-    data_path = "TE_50K.parquet"
-    version = 'CNN_TE_V4'
+    data_path = "data/Training_Data_RGC_3_55_500K.parquet"
+    version = 'CNN_RGC_3_55_V1'
     performance_dir = f"Model_Performance/{version}"
     model_dir = f"Models/{version}"
     os.makedirs(performance_dir, exist_ok=True)
     os.makedirs(model_dir, exist_ok=True)
 
     df = pd.read_parquet(data_path)
-    signal_cols = df.columns[0:500]
+    signal_cols = df.columns[0:512]
 
     scaler_path = f"{performance_dir}/{version}_scaler.pkl"
     scaler_area_path = f"{performance_dir}/{version}_scaler_area.pkl"
@@ -484,7 +477,6 @@ def main():
     if torch.backends.mps.is_available():
         torch.mps.empty_cache()
 
-    num_workers = min(4, os.cpu_count() or 1)
     learning_rate = 3e-4
     max_epochs = 100
     batch_size = 512
@@ -496,7 +488,7 @@ def main():
     
     model, trainer = train_model(
         X_train, y_train, X_val, y_val, X_test, y_test,
-        model_dir, performance_dir, version, num_workers,
+        model_dir, performance_dir, version,
         learning_rate, max_epochs, input_length, batch_size,
     )
     
@@ -509,9 +501,7 @@ def main():
         test_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
-        persistent_workers=num_workers > 0,
     )
     
     model.eval()
