@@ -63,10 +63,8 @@ def Baseline(
     else:
         raise ValueError(f"Invalid species: {species}. Choose 'proton' or 'deuteron'.")
 
-    # Convert frequency to angular frequency (rad/s)
     w = 2 * pi * f * 1e6
 
-    # Functions
     def slope():
         return delta_C / (0.25 * 2 * pi * 1e6)
 
@@ -86,19 +84,19 @@ def Baseline(
         S = 2 * Z_cable * alpha
         with np.errstate(divide="ignore", invalid="ignore"):
             result = np.sqrt((S + w * M * im_unit) / (w * D * im_unit))
-        return np.where(w == 0, 0, result)  # Avoid invalid values for w=0
+        return np.where(w == 0, 0, result)
 
     def beta(w):
         return beta1 * w
 
     def gamma(w):
-        return alpha + beta(w) * 1j  # Create a complex number using numpy
+        return alpha + beta(w) * 1j
 
     def ZC(w):
         Cw = C(w)
         with np.errstate(divide="ignore", invalid="ignore"):
             result = np.where(Cw != 0, 1 / (im_unit * w * Cw), 0)
-        return np.where(w == 0, 0, result)  # Avoid invalid values for w=0
+        return np.where(w == 0, 0, result)
 
     def vel(w):
         return 1 / beta(w)
@@ -110,7 +108,7 @@ def Baseline(
         return 0.11133
 
     def chi(w):
-        return np.zeros_like(w)  # Placeholder for x1(w) and x2(w)
+        return np.zeros_like(w)
 
     def pt(w):
         return ic(w)
@@ -124,13 +122,13 @@ def Baseline(
     def Zstray(w):
         with np.errstate(divide="ignore", invalid="ignore"):
             result = np.where(Cstray != 0, 1 / (im_unit * w * Cstray), 0)
-        return np.where(w == 0, 0, result)  # Avoid invalid values for w=0
+        return np.where(w == 0, 0, result)
 
     def ZL(w):
         return ZLpure(w) * Zstray(w) / (ZLpure(w) + Zstray(w))
 
     def ZT(w):
-        epsilon = 1e-10  # Small constant to avoid division by zero
+        epsilon = 1e-10
         return Z0(w) * (ZL(w) + Z0(w) * np.tanh(gamma(w) * l(w))) / (
             Z0(w) + ZL(w) * np.tanh(gamma(w) * l(w)) + epsilon
         )

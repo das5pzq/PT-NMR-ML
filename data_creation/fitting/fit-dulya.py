@@ -15,7 +15,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from physics.Lineshape import DulyaFit, QmeterGain
+from physics.lineshape import DulyaFit, QmeterGain
 
 PATH = "data-test"
 OUT_YAML = "fitting/dulya_fits_single_period.yaml"

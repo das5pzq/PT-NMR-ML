@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--p_max", type=float, default=0.6, help="Maximum polarization value")
     parser.add_argument("--alpha", type=float, default=2.0, help="Decay rate for power law distribution")
     parser.add_argument("--baseline", type=int, choices=[0, 1], default=1, help="Whether to add a baseline")
-    parser.add_argument("--noise_level", type=float, default=10*2.690506959957014e-05, help="Standard deviation of Gaussian noise")
+    parser.add_argument("--noise_level", type=float, default=0*2.690506959957014e-05, help="Standard deviation of Gaussian noise")
     parser.add_argument("--output_dir", default="Training_Data", help="Directory to save output Parquet files")
     parser.add_argument("--bound", type=float, default=0.08, help="Bound of the shift when shifting is enabled")
     parser.add_argument("--tensor-domain", type=str, choices=["None", "phase", "time"], default="None", help="Domain for tensor polarization. Choose between 'phase' or 'time'.")

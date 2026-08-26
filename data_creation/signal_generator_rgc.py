@@ -1,7 +1,3 @@
-"""RGC deuteron vector signal generator using empirical fit ranges."""
-
-from __future__ import annotations
-
 import logging
 import os
 from typing import List, Optional, Sequence
@@ -9,8 +5,8 @@ from typing import List, Optional, Sequence
 import numpy as np
 import tqdm
 
-from physics.Lineshape import DulyaFit, QmeterGain
-from physics.Modified_Baseline import Baseline
+from physics.lineshape import DulyaFit, QmeterGain
+from physics.baseline import Baseline
 from rgc_ranges import (
     BASELINE_SAMPLE_KEYS,
     CENTER_MHZ,
@@ -24,8 +20,6 @@ LOGGER_NAME = "RGCSignalGenerator"
 
 
 class RGCSignalGenerator:
-    """Monte Carlo deuteron spectra matching RGC Dulya + baseline fits."""
-
     def __init__(
         self,
         output_dir: str = "Training_Data_RGC",
@@ -111,7 +105,6 @@ class RGCSignalGenerator:
         if noise_std <= 0.0:
             return None
         return float(np.max(np.abs(lineshape)) / noise_std)
-    
 
     def generate_one(self, params: Optional[dict[str, float]] = None) -> dict:
         if params is None:

@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from physics.Modified_Baseline import Baseline, DEFAULT_CIRC_CONSTS
+from physics.baseline import Baseline, DEFAULT_CIRC_CONSTS
 
 PATH = "data-test"
 OUT_YAML = "fitting/baseline_fits_single_event.yaml"
@@ -23,15 +23,9 @@ OUT_STATS_DIR = "fitting/baseline_fit_stats_single_event"
 VOLTAGE_KEY = "baseline"
 SPECIES = "deuteron"
 
-# When enabled, only REFERENCE_EVENT_INDEX is fit; every other event reuses that
-# parameter vector (baseline is treated as constant within a file/period).
 REUSE_REFERENCE_FIT_FOR_ALL_EVENTS = True
-
-# When REUSE is off and this is on: event REFERENCE_EVENT_INDEX is fully fit;
-# later events keep its circuit parameters fixed while U, Cknob, eta, trim,
-# Cstray, phi_const, and DC_offset remain free.
 FIX_CIRCUIT_PARAMS_FROM_REFERENCE = True
-REFERENCE_EVENT_INDEX = 10  # 0-based index (event 1 in 1-based numbering)
+REFERENCE_EVENT_INDEX = 10
 
 FIT_PARAM_NAMES = (
     "U",
@@ -42,18 +36,6 @@ FIT_PARAM_NAMES = (
     "phi_const",
     "DC_offset",
 )
-# Optimizer bounds for the free knobs only; circuit params stay unbounded.
-# Leave disabled: even mild caps (e.g. U<=5) pin the fit at p0 and ruin the match.
-USE_FIT_BOUNDS = False
-FIT_BOUNDS: dict[str, tuple[float, float]] = {
-    "U": (0.0, 100.0),
-    "Cknob": (0.0, 1.0),
-    "eta": (1e-6, 0.1),
-    "trim": (-5.0, 5.0),
-    "Cstray": (-1e-10, 1e-10),
-    "phi_const": (-4.0 * np.pi, 4.0 * np.pi),
-    "DC_offset": (-50.0, 50.0),
-}
 CIRCUIT_PARAM_NAMES = (
     "L0",
     "Rcoil",
@@ -95,7 +77,6 @@ PARAM_NAMES = (
     "delta_l",
 )
 
-PRIMARY_PARAM_NAMES = FIT_PARAM_NAMES
 N_EXAMPLE_PLOTS = 4
 
 
@@ -134,62 +115,17 @@ def _assemble_params(
     )
 
 
-def _curve_fit_bounds(param_names: tuple[str, ...]) -> tuple[list[float], list[float]]:
-    lower: list[float] = []
-    upper: list[float] = []
-    for name in param_names:
-        if name in FIT_BOUNDS:
-            lo, hi = FIT_BOUNDS[name]
-            lower.append(float(lo))
-            upper.append(float(hi))
-        else:
-            lower.append(-np.inf)
-            upper.append(np.inf)
-    return lower, upper
-
-
-def _clip_to_bounds(values: dict[str, float]) -> dict[str, float]:
-    clipped: dict[str, float] = {}
-    for name, value in values.items():
-        if name in FIT_BOUNDS:
-            lo, hi = FIT_BOUNDS[name]
-            clipped[name] = float(np.clip(value, lo, hi))
-        else:
-            clipped[name] = float(value)
-    return clipped
-
-
 def fit_baseline(
     freq_mhz: np.ndarray,
     baseline: np.ndarray,
     fixed_circuit_params: dict[str, float] | None = None,
     fit_p0: dict[str, float] | None = None,
 ) -> tuple[np.ndarray, float, float]:
-    """Fit Q-meter ``Baseline`` to the full spectrum. Returns ``(params, nrmse, rmse)``.
-
-    NRMSE = RMSE / peak |baseline|.
-
-    If ``fixed_circuit_params`` is set, the circuit pack is held at the supplied
-    values while ``FIT_PARAM_NAMES`` are optimized.
-    """
-    default_fit_p0 = (
-        _clip_to_bounds(_default_fit_p0(baseline))
-        if USE_FIT_BOUNDS
-        else _default_fit_p0(baseline)
-    )
+    default_fit_p0 = _default_fit_p0(baseline)
     p0 = tuple(default_fit_p0[name] for name in FIT_PARAM_NAMES) + DEFAULT_CIRC_CONSTS
 
-    fit_kwargs: dict = {"maxfev": 500000}
-    if USE_FIT_BOUNDS:
-        fit_kwargs["bounds"] = _curve_fit_bounds(
-            FIT_PARAM_NAMES if fixed_circuit_params is not None else PARAM_NAMES
-        )
-
     if fixed_circuit_params is not None:
-        if fit_p0 is not None:
-            start = _clip_to_bounds(fit_p0) if USE_FIT_BOUNDS else fit_p0
-        else:
-            start = default_fit_p0
+        start = fit_p0 if fit_p0 is not None else default_fit_p0
 
         def model_free(
             f: np.ndarray,
@@ -218,7 +154,7 @@ def fit_baseline(
             freq_mhz,
             baseline,
             p0=free_p0,
-            **fit_kwargs,
+            maxfev=500000,
         )
         fit_params = dict(zip(FIT_PARAM_NAMES, free_fit, strict=True))
         params = _assemble_params(fit_params, fixed_circuit_params)
@@ -228,7 +164,7 @@ def fit_baseline(
             freq_mhz,
             baseline,
             p0=p0,
-            **fit_kwargs,
+            maxfev=500000,
         )
     return params, *_fit_errors(freq_mhz, baseline, params)
 
@@ -238,7 +174,6 @@ def _fit_errors(
     baseline: np.ndarray,
     params: np.ndarray,
 ) -> tuple[float, float]:
-    """NRMSE and RMSE of ``params`` over the full spectrum."""
     residual = baseline - baseline_fit(freq_mhz, *params)
     rmse = float(np.sqrt(np.mean(residual**2)))
     peak_amp = float(np.max(np.abs(baseline)))
@@ -302,7 +237,7 @@ def summarize_fits(results: dict[str, dict], n_fitted: int, n_skipped: int) -> d
         },
         "primary_params": {
             name: _percentile_stats(np.asarray([r[name] for r in rows], dtype=np.float64))
-            for name in PRIMARY_PARAM_NAMES
+            for name in FIT_PARAM_NAMES
         },
     }
     return summary
@@ -343,7 +278,6 @@ def plot_fit_statistics(results: dict[str, dict], out_dir: Path) -> list[Path]:
     nrmse = np.asarray([r["nrmse"] for r in rows], dtype=np.float64)
     rmse = np.asarray([r["rmse"] for r in rows], dtype=np.float64)
     cknob = np.asarray([r["Cknob"] for r in rows], dtype=np.float64)
-    u_vals = np.asarray([r["U"] for r in rows], dtype=np.float64)
 
     fig, axes = plt.subplots(2, 2, figsize=(11, 8))
     axes[0, 0].hist(nrmse, bins=50, color="steelblue", edgecolor="white", alpha=0.9)
@@ -370,12 +304,12 @@ def plot_fit_statistics(results: dict[str, dict], out_dir: Path) -> list[Path]:
     plt.close(fig)
     written.append(path)
 
-    n_primary = len(PRIMARY_PARAM_NAMES)
+    n_primary = len(FIT_PARAM_NAMES)
     n_cols = 3
     n_rows = int(np.ceil(n_primary / n_cols))
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(11, 3.2 * n_rows))
     axes_flat = np.atleast_1d(axes).ravel()
-    for ax, name in zip(axes_flat, PRIMARY_PARAM_NAMES, strict=False):
+    for ax, name in zip(axes_flat, FIT_PARAM_NAMES, strict=False):
         values = np.asarray([r[name] for r in rows], dtype=np.float64)
         ax.hist(values, bins=40, color="0.45", edgecolor="white", alpha=0.9)
         ax.axvline(np.median(values), color="crimson", ls="--", lw=1.0)

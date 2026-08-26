@@ -1,14 +1,3 @@
-"""Empirical RGC Monte Carlo parameter sampling from fitted event parameters.
-
-Primary source: per-event fits in ``fitting/dulya_fits_single_period.yaml`` and
-``fitting/baseline_fits_single_event.yaml`` (bootstrap resampling).
-
-Fallback: uniform draws from min–max in the stats YAML files when fit pools are
-missing.
-"""
-
-from __future__ import annotations
-
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -17,10 +6,10 @@ import numpy as np
 import yaml
 
 _DATA_DIR = Path(__file__).resolve().parent
-DULYA_FITS_YAML = _DATA_DIR / "dulya_fits_single_period.yaml"
-BASELINE_FITS_YAML = _DATA_DIR / "baseline_fits_single_event.yaml"
-DULYA_STATS_YAML = _DATA_DIR / "dulya_fit_stats_single_period.yaml"
-BASELINE_STATS_YAML = _DATA_DIR / "baseline_fit_stats_single_event.yaml"
+DULYA_FITS_YAML = _DATA_DIR / "fitting" / "dulya_fits_single_period.yaml"
+BASELINE_FITS_YAML = _DATA_DIR / "fitting" / "baseline_fits_single_event.yaml"
+DULYA_STATS_YAML = _DATA_DIR / "fitting" / "dulya_fit_stats_single_period.yaml"
+BASELINE_STATS_YAML = _DATA_DIR / "fitting" / "baseline_fit_stats_single_event.yaml"
 
 RGC_FREQ_MIN_MHZ = 32.3
 RGC_FREQ_MAX_MHZ = 33.1
