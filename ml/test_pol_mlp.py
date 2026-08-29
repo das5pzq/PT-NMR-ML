@@ -1,3 +1,7 @@
+"""
+Does test on sample data that was fitted to to generate data (preliminary work).
+"""
+
 import argparse
 import json
 import pickle

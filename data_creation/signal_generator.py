@@ -1,15 +1,3 @@
-#!/usr/bin/env python3
-"""
-High-level signal generation utilities for training data creation.
-
-This module keeps the main CLI thin while grouping the generation logic,
-sampling helpers, and noise handling in one place. The goal is to keep the
-code readable, testable, and easy to extend for additional modes or
-polarization types.
-"""
-
-from __future__ import annotations
-
 import logging
 import os
 from dataclasses import dataclass
