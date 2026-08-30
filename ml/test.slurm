@@ -17,7 +17,6 @@
 VERSION="Test_MLP"
 DATA="data/20_25_500K.parquet"
 BATCH_SIZE=256
-# Set to "--compile" to enable torch.compile, or leave empty
 COMPILE_FLAG=""
 
 module purge

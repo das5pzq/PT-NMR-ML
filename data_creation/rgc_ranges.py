@@ -7,11 +7,7 @@ import yaml
 
 _DATA_DIR = Path(__file__).resolve().parent
 DULYA_FITS_YAML = _DATA_DIR / "fitting" / "dulya_fits_single_period.yaml"
-<<<<<<< HEAD
 BASELINE_FITS_YAML = _DATA_DIR / "fitting" / "baseline_fits_single_event.yaml"
-=======
-BASELINE_FITS_YAML = _DATA_DIR /"fitting" / "baseline_fits_single_event.yaml"
->>>>>>> 0b11be4 (adding updates)
 DULYA_STATS_YAML = _DATA_DIR / "fitting" / "dulya_fit_stats_single_period.yaml"
 BASELINE_STATS_YAML = _DATA_DIR / "fitting" / "baseline_fit_stats_single_event.yaml"
 

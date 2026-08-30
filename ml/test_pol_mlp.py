@@ -1,5 +1,5 @@
 """
-Does test on sample data that was fitted to to generate data (preliminary work).
+Does prediction on selected RGC dataset. 
 """
 
 import argparse

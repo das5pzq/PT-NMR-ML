@@ -61,8 +61,8 @@ class BaselineConfig:
     # Cknob: float = 0.0647
     vary_baseline: bool = True
     U_range: Tuple[float, float] = (0.1, 1.0)
-    Cknob_range: Tuple[float, float] = (0.201, 0.207)
-    # Cknob_range: Tuple[float, float] = (0.0477, 0.0647)
+    # Cknob_range: Tuple[float, float] = (0.201, 0.207) ### this config is for deuteron, need to connect to --mode arg
+    Cknob_range: Tuple[float, float] = (0.0477, 0.0647) ### this config is for proton, need to connect to --mode arg
     phase_range: Tuple[float, float] = (2*np.pi * .80, 2 * np.pi * 1.20)
 
 class SignalGenerator:
