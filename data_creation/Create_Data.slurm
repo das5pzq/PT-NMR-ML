@@ -6,12 +6,14 @@
 #SBATCH -c 8
 #SBATCH --mem=8G
 #SBATCH -t 1:00:00
-#SBATCH -A account_name
+#SBATCH -A spinquest_standard
 #SBATCH --array=1-1     # Parallel jobs; total samples = NUM_SAMPLES * array_size
+
+set -euo pipefail
 
 # ===== Global Configuration =====
 # Set these variables to configure the job
-PROJECT_DIR="`/path/to/project`"  ### Change this to your own directory
+PROJECT_DIR="."  ### Change this to your own directory
 OUTPUT_DIR="${PROJECT_DIR}/Test"
 OUTPUT_FILENAME="Test.parquet"  # Final merged filename
 MODE="deuteron"                       # Options: deuteron, proton
@@ -56,12 +58,15 @@ echo "  - Baseline: ${BASELINE}"
 echo "  - Noise level: ${NOISE_LEVEL}"
 echo "  - Shifting: ${SHIFTING}"
 echo "  - Bound: ${BOUND}"
+
 module purge
-echo "Modules purged"
-echo "Modules loaded"
-module load miniforge/24.11.3-py3.12
+module load apptainer pytorch/2.9.0
+SIF="${CONTAINERDIR}/pytorch-2.9.0.sif"
+
+
 mkdir -p ${OUTPUT_DIR}
 chmod 755 ${OUTPUT_DIR}
+
 echo "Output directory created: ${OUTPUT_DIR}"
 
 
@@ -69,7 +74,7 @@ echo "Output directory created: ${OUTPUT_DIR}"
 echo "Generating signal data..."
 
 echo "Running signal generation script..."
-python Create_Training_Data.py \
+apptainer run "${SIF}" Create_Training_Data.py \
     --job_id ${SLURM_ARRAY_TASK_ID} \
     --mode ${MODE} \
     --polarization_type ${POLARIZATION_TYPE} \
@@ -160,10 +165,11 @@ if [ "${SLURM_ARRAY_TASK_ID}" -eq "1" ]; then
 set -euo pipefail
 
 module purge
-module load miniforge/24.11.3-py3.12
+module load apptainer pytorch/2.9.0
+SIF="${CONTAINERDIR}/pytorch-2.9.0.sif"
 
 cd "${PROJECT_DIR}"
-python merge.py "${OUTPUT_DIR}" "${OUTPUT_FILENAME}" "Sample_*.parquet"
+apptainer run "${SIF}" merge.py "${OUTPUT_DIR}" "${OUTPUT_FILENAME}" "Sample_*.parquet"
 EOF
 
     sbatch --dependency=afterok:${SLURM_ARRAY_JOB_ID} ${MERGE_SCRIPT}
