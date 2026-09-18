@@ -1,15 +1,3 @@
-#!/usr/bin/env python3
-"""
-High-level signal generation utilities for training data creation.
-
-This module keeps the main CLI thin while grouping the generation logic,
-sampling helpers, and noise handling in one place. The goal is to keep the
-code readable, testable, and easy to extend for additional modes or
-polarization types.
-"""
-
-from __future__ import annotations
-
 import logging
 import os
 from dataclasses import dataclass
@@ -73,8 +61,8 @@ class BaselineConfig:
     # Cknob: float = 0.0647
     vary_baseline: bool = True
     U_range: Tuple[float, float] = (0.1, 1.0)
-    Cknob_range: Tuple[float, float] = (0.201, 0.207)
-    # Cknob_range: Tuple[float, float] = (0.0477, 0.0647)
+    # Cknob_range: Tuple[float, float] = (0.201, 0.207) ### this config is for deuteron, need to connect to --mode arg
+    Cknob_range: Tuple[float, float] = (0.0477, 0.0647) ### this config is for proton, need to connect to --mode arg
     phase_range: Tuple[float, float] = (2*np.pi * .80, 2 * np.pi * 1.20)
 
 class SignalGenerator:

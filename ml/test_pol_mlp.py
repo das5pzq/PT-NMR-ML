@@ -1,3 +1,7 @@
+"""
+Does prediction on selected RGC dataset. 
+"""
+
 import argparse
 import json
 import pickle
