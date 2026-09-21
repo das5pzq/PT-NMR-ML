@@ -23,6 +23,7 @@ OUT_STATS_YAML = "fitting/dulya_fit_stats_single_period.yaml"
 OUT_STATS_DIR = "fitting/dulya_fit_stats_single_period"
 
 VOLTAGE_KEY = "basesub"
+SKIP_LABELS = frozenset({"junk"})
 
 CENTER_MHZ = 32.68
 HALF_WIDTH_MHZ = 0.075  # fallback if peak finding fails
@@ -342,7 +343,7 @@ def summarize_fits(results: dict[str, dict], n_fitted: int, n_skipped: int) -> d
 def print_summary(summary: dict) -> None:
     print("\n=== Dulya fit summary ===")
     print(f"fixed:   eta={ETA_FIXED:.6g}  g={G_FIXED:.6g}  (from evt 349)")
-    print(f"gates:   MAX_NRMSE={MAX_NRMSE}  MIN_MODEL_SNR={MIN_MODEL_SNR}  REQUIRE_DOUBLET={REQUIRE_DOUBLET}")
+    print(f"gates:   MAX_NRMSE={MAX_NRMSE}  MIN_MODEL_SNR={MIN_MODEL_SNR}  REQUIRE_DOUBLET={REQUIRE_DOUBLET}  skip_labels={sorted(SKIP_LABELS)}")
     print(f"files:   {summary.get('n_files', 0)}")
     print(f"fitted:  {summary.get('n_events_fitted', 0)}")
     print(f"skipped: {summary.get('n_events_skipped', 0)}")
@@ -480,6 +481,10 @@ def main() -> None:
         file_events: dict[int, dict] = {}
 
         for index, record in tqdm(enumerate(records), desc="Events"):
+            label = str(record.get("label") or "").strip().lower()
+            if label in SKIP_LABELS:
+                n_skipped += 1
+                continue
             if VOLTAGE_KEY not in record or "pol" not in record or "cc" not in record:
                 n_skipped += 1
                 continue

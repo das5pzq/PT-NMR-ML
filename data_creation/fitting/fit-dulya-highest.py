@@ -24,8 +24,8 @@ OUT_STATS_YAML = "fitting/dulya_fit_stats_highest.yaml"
 OUT_STATS_DIR = "fitting/dulya_fit_stats_highest"
 
 VOLTAGE_KEY = "basesub"
-VALID_LABELS = frozenset({"Polarize"})
-MAX_PEAK_CANDIDATES_PER_SIGN = 8
+VALID_LABELS = frozenset({"polarize"})
+SKIP_LABELS = frozenset({"junk"})
 
 CENTER_MHZ = 32.68
 HALF_WIDTH_MHZ = 0.075  # fallback if peak finding fails
@@ -35,7 +35,7 @@ POLYNOMIAL_DEGREE = 2
 CENTER_NOISE_FRAC = 0.1
 MIN_CENTER_NOISE_BINS = 8
 MIN_MODEL_SNR = 3.0
-MAX_NRMSE = 0.5
+MAX_NRMSE = 0.05
 REQUIRE_DOUBLET = True
 SKIP_FLIPPED_SIGN = False
 MAX_NFEV = 800  
@@ -344,7 +344,7 @@ def summarize_fits(results: dict[str, dict], n_fitted: int, n_skipped: int) -> d
 
 def print_summary(summary: dict) -> None:
     print("\n=== Dulya fit summary ===")
-    print("mode:    peak Polarize event of each sign per file (Junk/Baseline/TE skipped)")
+    print("mode:    peak Polarize event of each sign per file (junk tag / Baseline / TE skipped)")
     print(f"fixed:   eta={ETA_FIXED:.6g}  g={G_FIXED:.6g}  (from evt 349)")
     print(f"gates:   MAX_NRMSE={MAX_NRMSE}  MIN_MODEL_SNR={MIN_MODEL_SNR}  REQUIRE_DOUBLET={REQUIRE_DOUBLET}")
     print(f"files:   {summary.get('n_files', 0)}")
@@ -469,8 +469,17 @@ def _record_pol(record: dict) -> float | None:
     return pol
 
 
+def _event_label(record: dict) -> str:
+    return str(record.get("label") or "").strip().lower()
+
+
+def is_junk_event(record: dict) -> bool:
+    return _event_label(record) in SKIP_LABELS
+
+
 def is_valid_polarize_event(record: dict, freq_mhz: np.ndarray) -> bool:
-    if record.get("label") not in VALID_LABELS:
+    label = _event_label(record)
+    if is_junk_event(record) or label not in VALID_LABELS:
         return False
     if VOLTAGE_KEY not in record or "pol" not in record or "cc" not in record:
         return False
@@ -481,7 +490,7 @@ def is_valid_polarize_event(record: dict, freq_mhz: np.ndarray) -> bool:
 
 
 def peak_pol_candidates(records: list[dict], freq_mhz: np.ndarray) -> list[int]:
-    """Most-positive and most-negative Polarize events, with fallbacks if a fit fails."""
+    """Polarize events ordered by |pol|, so each sign can fall back until a fit passes."""
     valid: list[tuple[int, float]] = []
     for index, record in enumerate(records):
         if not is_valid_polarize_event(record, freq_mhz):
@@ -506,7 +515,7 @@ def peak_pol_candidates(records: list[dict], freq_mhz: np.ndarray) -> list[int]:
     ordered: list[int] = []
     seen: set[int] = set()
     for group in (positive, negative):
-        for index, _pol in group[:MAX_PEAK_CANDIDATES_PER_SIGN]:
+        for index, _pol in group:
             if index not in seen:
                 seen.add(index)
                 ordered.append(index)
@@ -518,6 +527,8 @@ def try_fit_event(
     freq_mhz: np.ndarray,
     mask: np.ndarray,
 ) -> dict | None:
+    if is_junk_event(record):
+        return None
     signal = np.asarray(record[VOLTAGE_KEY], dtype=np.float64)
     try:
         p_true = float(record["pol"])
