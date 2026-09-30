@@ -6,11 +6,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor, Callback
-from lightning.pytorch.loggers import CSVLogger
-from lightning.pytorch import Trainer
-from lightning.pytorch.core import LightningModule
-import matplotlib.pyplot as plt
 import random
 import warnings
 warnings.filterwarnings('ignore')
@@ -24,14 +19,19 @@ np.random.seed(42)
 torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
 
-def _accelerator():
-    if torch.cuda.is_available():
-        return 'cuda', torch.cuda.device_count()
-    if torch.backends.mps.is_available():
-        return 'mps', 1
-    return 'cpu', 1
+MAX_GRAD_NORM = 1.0
 
-ACCELERATOR, N_DEVICES = _accelerator()
+
+def _device():
+    if torch.cuda.is_available():
+        return torch.device('cuda')
+    if torch.backends.mps.is_available():
+        return torch.device('mps')
+    return torch.device('cpu')
+
+
+DEVICE = _device()
+
 
 class NMRDataset(Dataset):
     def __init__(self, X, y):
@@ -43,6 +43,7 @@ class NMRDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.X[idx], self.y[idx]
+
 
 class SimpleFeedForward(nn.Module):
     def __init__(
@@ -69,7 +70,10 @@ class SimpleFeedForward(nn.Module):
         return torch.cat([p, q], dim=-1)
 
 
-class FFLightningModule(LightningModule):
+# Backwards-compatible name used by older test scripts / docs.
+class FFLightningModule(nn.Module):
+    """Thin wrapper around SimpleFeedForward (no Lightning)."""
+
     def __init__(
         self,
         input_dim=512,
@@ -79,69 +83,95 @@ class FFLightningModule(LightningModule):
         weight_decay=1e-5,
     ):
         super().__init__()
-        self.save_hyperparameters()
-        self.model = SimpleFeedForward(
-            input_dim,
-            hidden_dim,
-        )
+        self.model = SimpleFeedForward(input_dim, hidden_dim)
         self.criterion = nn.L1Loss()
         self.learning_rate = learning_rate
         self.max_epochs = max_epochs
         self.weight_decay = weight_decay
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
 
     def forward(self, x):
         return self.model(x)
 
 
-    def _split_losses(self, y_hat, y):
-        loss_p = self.criterion(y_hat[:, 0:1], y[:, 0:1])
-        loss_q = self.criterion(y_hat[:, 1:2], y[:, 1:2])
-        return loss_p + loss_q, loss_p, loss_q
+def _split_losses(criterion, y_hat, y):
+    loss_p = criterion(y_hat[:, 0:1], y[:, 0:1])
+    loss_q = criterion(y_hat[:, 1:2], y[:, 1:2])
+    return loss_p + loss_q, loss_p, loss_q
 
-    def training_step(self, batch, batch_idx):
-        x, y = batch
-        y_hat = self(x)
-        loss, loss_p, loss_q = self._split_losses(y_hat, y)
-        mae = F.l1_loss(y_hat, y)
-        self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log('train_loss_p', loss_p, on_step=False, on_epoch=True)
-        self.log('train_loss_q', loss_q, on_step=False, on_epoch=True)
-        self.log('train_mae', mae, on_step=False, on_epoch=True, prog_bar=True)
-        return loss
 
-    def validation_step(self, batch, batch_idx):
-        x, y = batch
-        y_hat = self(x)
-        loss, loss_p, loss_q = self._split_losses(y_hat, y)
-        mae = F.l1_loss(y_hat, y)
-        self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log('val_loss_p', loss_p, on_step=False, on_epoch=True)
-        self.log('val_loss_q', loss_q, on_step=False, on_epoch=True)
-        self.log('val_mae', mae, on_step=False, on_epoch=True, prog_bar=True)
+def _clone_state_dict(model):
+    return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
-    def test_step(self, batch, batch_idx):
-        x, y = batch
-        y_hat = self(x)
-        loss, loss_p, loss_q = self._split_losses(y_hat, y)
-        mae = F.l1_loss(y_hat, y)
-        self.log('test_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log('test_loss_p', loss_p, on_step=False, on_epoch=True)
-        self.log('test_loss_q', loss_q, on_step=False, on_epoch=True)
-        self.log('test_mae', mae, on_step=False, on_epoch=True, prog_bar=True)
 
-    def configure_optimizers(self):
-        optimizer = optim.AdamW(
-            self.parameters(),
-            lr=self.learning_rate,
-            weight_decay=self.weight_decay,
+def _checkpoint_path(model_dir):
+    return os.path.join(model_dir, "best_model_checkpoint.pth")
+
+
+def _legacy_checkpoint_path(model_dir):
+    return os.path.join(model_dir, "best_model_checkpoint.ckpt")
+
+
+def save_checkpoint(path, *, model, optimizer, scheduler, epoch, best_val_mae,
+                    input_dim, hidden_dim, learning_rate, max_epochs, weight_decay,
+                    history):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    torch.save(
+        {
+            "model_state_dict": _clone_state_dict(model),
+            "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
+            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+            "epoch": epoch,
+            "best_val_mae": best_val_mae,
+            "input_dim": input_dim,
+            "hidden_dim": hidden_dim,
+            "learning_rate": learning_rate,
+            "max_epochs": max_epochs,
+            "weight_decay": weight_decay,
+            "history": history,
+        },
+        path,
+    )
+
+
+def load_model_from_checkpoint(path, device=None):
+    """Load FFLightningModule / SimpleFeedForward from a .pth or legacy Lightning .ckpt."""
+    if device is None:
+        device = DEVICE
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+
+    if "model_state_dict" in ckpt:
+        input_dim = ckpt.get("input_dim", 512)
+        hidden_dim = ckpt.get("hidden_dim", 256)
+        module = FFLightningModule(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            learning_rate=ckpt.get("learning_rate", 1e-3),
+            max_epochs=ckpt.get("max_epochs", 500),
+            weight_decay=ckpt.get("weight_decay", 1e-5),
         )
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=self.max_epochs, eta_min=1e-7
-        )
-        return {
-            'optimizer': optimizer,
-            'lr_scheduler': {'scheduler': scheduler, 'interval': 'epoch'},
-        }
+        module.model.load_state_dict(ckpt["model_state_dict"])
+        module.to(device)
+        return module, ckpt
+
+    # Legacy Lightning checkpoint
+    hparams = ckpt.get("hyper_parameters", {})
+    module = FFLightningModule(
+        input_dim=hparams.get("input_dim", 512),
+        hidden_dim=hparams.get("hidden_dim", 256),
+        learning_rate=hparams.get("learning_rate", 1e-3),
+        max_epochs=hparams.get("max_epochs", 500),
+        weight_decay=hparams.get("weight_decay", 1e-5),
+    )
+    state = {
+        k.replace("model.", "", 1): v
+        for k, v in ckpt["state_dict"].items()
+        if k.startswith("model.")
+    }
+    module.model.load_state_dict(state)
+    module.to(device)
+    return module, ckpt
 
 
 def _load_or_create_model(
@@ -151,32 +181,36 @@ def _load_or_create_model(
     learning_rate,
     max_epochs,
     weight_decay=1e-5,
+    device=None,
 ):
+    if device is None:
+        device = DEVICE
 
-    ckpt_path = os.path.join(model_dir, "best_model_checkpoint.ckpt")
+    ckpt_path = _checkpoint_path(model_dir)
+    legacy_path = _legacy_checkpoint_path(model_dir)
+    resume_path = None
+    if os.path.isfile(ckpt_path):
+        resume_path = ckpt_path
+    elif os.path.isfile(legacy_path):
+        resume_path = legacy_path
 
-    if not ckpt_path or not os.path.isfile(ckpt_path):
-        print("No existing model found. Building new model...")
-        return FFLightningModule(
+    if resume_path is None:
+        print("No existing model found. Building new model...", flush=True)
+        model = FFLightningModule(
             input_dim=input_dim,
             hidden_dim=hidden_dim,
             learning_rate=learning_rate,
             max_epochs=max_epochs,
             weight_decay=weight_decay,
-        ), None
+        ).to(device)
+        return model, None, None
 
-    print(f"Resuming from {ckpt_path})")
-    model = FFLightningModule.load_from_checkpoint(
-        ckpt_path,
-        map_location='cuda',
-        weights_only=False,
-        max_epochs=max_epochs,
-    )
+    print(f"Resuming from {resume_path}", flush=True)
+    model, ckpt = load_model_from_checkpoint(resume_path, device=device)
     model.learning_rate = learning_rate
     model.max_epochs = max_epochs
     model.weight_decay = weight_decay
-
-    return model, ckpt_path
+    return model, resume_path, ckpt
 
 
 def _load_prior_loss_history(save_path):
@@ -188,65 +222,42 @@ def _load_prior_loss_history(save_path):
     return history
 
 
-class LossHistoryCallback(Callback):
-    def __init__(self, save_path, prior_history=None):
-        super().__init__()
-        self.save_path = save_path
-        self.epoch_train_loss = []
-        self.epoch_val_loss = []
-        self.epoch_train_mae = []
-        self.epoch_val_mae = []
-        if prior_history is not None:
-            for col, buf in (
-                ("train_loss", self.epoch_train_loss),
-                ("val_loss", self.epoch_val_loss),
-                ("train_mae", self.epoch_train_mae),
-                ("val_mae", self.epoch_val_mae),
-            ):
-                if col in prior_history.columns:
-                    buf.extend(prior_history[col].dropna().tolist())
+def _run_epoch(model, loader, criterion, device, optimizer=None):
+    train = optimizer is not None
+    model.train(train)
+    loss_sum = 0.0
+    mae_sum = 0.0
+    n_batches = 0
 
-    def on_validation_epoch_end(self, trainer, pl_module):
-        m = trainer.callback_metrics
-        if 'train_loss' in m: self.epoch_train_loss.append(float(m['train_loss'].cpu()))
-        if 'val_loss'   in m: self.epoch_val_loss.append(float(m['val_loss'].cpu()))
-        if 'train_mae'  in m: self.epoch_train_mae.append(float(m['train_mae'].cpu()))
-        if 'val_mae'    in m: self.epoch_val_mae.append(float(m['val_mae'].cpu()))
+    for x, y in loader:
+        x = x.to(device)
+        y = y.to(device)
+        y_hat = model(x)
+        loss, _, _ = _split_losses(criterion, y_hat, y)
+        mae = F.l1_loss(y_hat, y)
 
-    def on_fit_end(self, trainer, pl_module):
-        n = max(
-            len(self.epoch_train_loss),
-            len(self.epoch_val_loss),
-            len(self.epoch_train_mae),
-            len(self.epoch_val_mae),
-        )
-        if n == 0:
-            return
-        pd.DataFrame({
-            'epoch': range(1, n + 1),
-            'train_loss': self.epoch_train_loss + [None] * (n - len(self.epoch_train_loss)),
-            'val_loss':   self.epoch_val_loss   + [None] * (n - len(self.epoch_val_loss)),
-            'train_mae':  self.epoch_train_mae  + [None] * (n - len(self.epoch_train_mae)),
-            'val_mae':    self.epoch_val_mae    + [None] * (n - len(self.epoch_val_mae)),
-        }).to_csv(self.save_path, index=False)
-        print(f"Saved loss history to {self.save_path}")
+        if train:
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
+            optimizer.step()
 
+        loss_sum += loss.item()
+        mae_sum += mae.item()
+        n_batches += 1
 
-class SetLearningRateCallback(Callback):
-
-    def on_fit_start(self, trainer, pl_module):
-        if not trainer.optimizers:
-            return
-        for param_group in trainer.optimizers[0].param_groups:
-            param_group['lr'] = pl_module.learning_rate
+    n = max(n_batches, 1)
+    return loss_sum / n, mae_sum / n
 
 
 def train_model(X_train, y_train, X_val, y_val, X_test, y_test,
                 model_dir, performance_dir, version,
                 learning_rate=1e-3, max_epochs=500,
                 hidden_dim=256, batch_size=256, weight_decay=1e-5,
-                ):
+                device=None):
 
+    if device is None:
+        device = DEVICE
     pin = torch.cuda.is_available()
 
     train_loader = DataLoader(
@@ -266,50 +277,123 @@ def train_model(X_train, y_train, X_val, y_val, X_test, y_test,
     loss_history_path = f"{performance_dir}/{version}_loss.csv"
     prior_loss_history = _load_prior_loss_history(loss_history_path)
 
-    model, fit_ckpt_path = _load_or_create_model(
+    model, resume_path, resume_ckpt = _load_or_create_model(
         model_dir,
         input_dim,
         hidden_dim,
         learning_rate,
         max_epochs,
         weight_decay,
+        device=device,
     )
 
-    callbacks = [
-        ModelCheckpoint(
-            dirpath=model_dir,
-            filename='best_model_checkpoint',
-            monitor='val_mae',
-            save_top_k=1,
-            mode='min',
-            save_last=True,
-        ),
-        LearningRateMonitor(),
-        LossHistoryCallback(save_path=loss_history_path, prior_history=prior_loss_history),
-    ]
-    if fit_ckpt_path is not None:
-        callbacks.append(SetLearningRateCallback())
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f'Trainable parameters: {n_trainable:,}', flush=True)
 
-    trainer = Trainer(
-        max_epochs=max_epochs,
-        callbacks=callbacks,
-        logger=CSVLogger(performance_dir, name='training_log'),
-        accelerator=ACCELERATOR,
-        devices=N_DEVICES,
-        gradient_clip_val=1.0,
-        enable_progress_bar=True,
+    criterion = nn.L1Loss()
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=weight_decay,
+    )
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max_epochs, eta_min=1e-7
     )
 
-    trainer.fit(model, train_loader, val_loader, ckpt_path=fit_ckpt_path)
+    history = {
+        'train_loss': [],
+        'val_loss': [],
+        'train_mae': [],
+        'val_mae': [],
+    }
+    if prior_loss_history is not None:
+        for col in history:
+            if col in prior_loss_history.columns:
+                history[col].extend(prior_loss_history[col].dropna().tolist())
 
-    checkpoint_cb = callbacks[0]
-    best_ckpt = checkpoint_cb.best_model_path
-    if best_ckpt and os.path.isfile(best_ckpt):
-        best_module = FFLightningModule.load_from_checkpoint(best_ckpt, weights_only=False)
-        torch.save(best_module.model.state_dict(), f"{model_dir}/best_model.pth")
-        model = best_module
-    else:
-        torch.save(model.model.state_dict(), f"{model_dir}/best_model.pth")
+    start_epoch = 0
+    best_val_mae = float('inf')
+    best_state = _clone_state_dict(model.model)
 
-    trainer.test(model, test_loader)
-    return model, trainer
+    if resume_ckpt is not None and "model_state_dict" in resume_ckpt:
+        if resume_ckpt.get("optimizer_state_dict") is not None:
+            try:
+                optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
+            except (ValueError, KeyError) as exc:
+                print(f"Could not restore optimizer state ({exc}); continuing with fresh optimizer.", flush=True)
+        if resume_ckpt.get("scheduler_state_dict") is not None:
+            try:
+                scheduler.load_state_dict(resume_ckpt["scheduler_state_dict"])
+            except (ValueError, KeyError) as exc:
+                print(f"Could not restore scheduler state ({exc}); continuing with fresh scheduler.", flush=True)
+        for pg in optimizer.param_groups:
+            pg['lr'] = learning_rate
+        start_epoch = int(resume_ckpt.get("epoch", 0))
+        best_val_mae = float(resume_ckpt.get("best_val_mae", float('inf')))
+        if resume_ckpt.get("history"):
+            for col, values in resume_ckpt["history"].items():
+                if col in history and values:
+                    history[col] = list(values)
+
+    ckpt_path = _checkpoint_path(model_dir)
+    best_pth_path = f"{model_dir}/best_model.pth"
+
+    for epoch in range(start_epoch, max_epochs):
+        train_loss, train_mae = _run_epoch(
+            model, train_loader, criterion, device, optimizer=optimizer
+        )
+        val_loss, val_mae = _run_epoch(
+            model, val_loader, criterion, device, optimizer=None
+        )
+        scheduler.step()
+        lr = optimizer.param_groups[0]['lr']
+
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
+        history['train_mae'].append(train_mae)
+        history['val_mae'].append(val_mae)
+
+        print(
+            f'epoch {epoch + 1:03d}/{max_epochs} | train {train_loss:.6f} | val {val_loss:.6f} | '
+            f'train_mae {train_mae:.6f} | val_mae {val_mae:.6f} | lr {lr:.2e}',
+            flush=True,
+        )
+
+        if val_mae < best_val_mae:
+            best_val_mae = val_mae
+            best_state = _clone_state_dict(model.model)
+            save_checkpoint(
+                ckpt_path,
+                model=model.model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                epoch=epoch + 1,
+                best_val_mae=best_val_mae,
+                input_dim=input_dim,
+                hidden_dim=hidden_dim,
+                learning_rate=learning_rate,
+                max_epochs=max_epochs,
+                weight_decay=weight_decay,
+                history=history,
+            )
+            torch.save(best_state, best_pth_path)
+
+    n = max(len(history['train_loss']), 1)
+    pd.DataFrame({
+        'epoch': range(1, n + 1),
+        'train_loss': history['train_loss'] + [None] * (n - len(history['train_loss'])),
+        'val_loss': history['val_loss'] + [None] * (n - len(history['val_loss'])),
+        'train_mae': history['train_mae'] + [None] * (n - len(history['train_mae'])),
+        'val_mae': history['val_mae'] + [None] * (n - len(history['val_mae'])),
+    }).to_csv(loss_history_path, index=False)
+    print(f"Saved loss history to {loss_history_path}", flush=True)
+
+    if best_state is not None:
+        model.model.load_state_dict(best_state)
+    if not os.path.isfile(best_pth_path):
+        torch.save(model.model.state_dict(), best_pth_path)
+
+    test_loss, test_mae = _run_epoch(model, test_loader, criterion, device, optimizer=None)
+    print(f'test | loss {test_loss:.6f} | mae {test_mae:.6f}', flush=True)
+
+    return model, history

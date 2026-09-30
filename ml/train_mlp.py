@@ -84,7 +84,7 @@ if __name__ == "__main__":
     print("Training MLP Model")
     print("=" * 60)
 
-    model, trainer = train_model(
+    model, _history = train_model(
         X_train, y_train, X_val, y_val, X_test, y_test,
         model_dir, performance_dir, version,
         learning_rate=learning_rate,

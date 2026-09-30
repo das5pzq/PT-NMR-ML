@@ -6,10 +6,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor, Callback
-from lightning.pytorch.loggers import CSVLogger
-from lightning.pytorch import Trainer
-from lightning.pytorch.core import LightningModule
 import random
 import warnings
 warnings.filterwarnings('ignore')
@@ -17,9 +13,9 @@ import sys
 
 POLARIZATION_RANGE = "HIGH_POL"  # Options: HIGH_POL (2% - 60), LOW_POL (TE - 2%)
 USE_SE_BLOCK = POLARIZATION_RANGE == "HIGH_POL"
+MAX_GRAD_NORM = 1.0
 
 sys.stdout.flush()
-
 sys.stderr.flush()
 
 random.seed(42)
@@ -29,15 +25,15 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(42)
 
 
-def _accelerator_and_device():
+def _device():
     if torch.cuda.is_available():
-        return "cuda", torch.cuda.device_count(), torch.device("cuda")
+        return torch.device("cuda")
     if torch.backends.mps.is_available():
-        return "mps", 1, torch.device("mps")
-    return "cpu", 1, torch.device("cpu")
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
-ACCELERATOR, N_DEVICES, device = _accelerator_and_device()
+DEVICE = _device()
 
 
 class NMRDataset(Dataset):
@@ -59,6 +55,7 @@ class NMRDataset(Dataset):
         x_row = torch.from_numpy(self.X[idx]).unsqueeze(0)
         y_row = torch.from_numpy(self.y[idx])
         return x_row, y_row
+
 
 class InceptionBlock(nn.Module):
     """
@@ -94,6 +91,7 @@ class InceptionBlock(nn.Module):
             dim=1,
         )
 
+
 class ResidualBlock(nn.Module):
 
     """Residual block with two Conv1D layers and batch normalization"""
@@ -103,21 +101,22 @@ class ResidualBlock(nn.Module):
         self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1)
         self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1)
         self.bn = nn.BatchNorm1d(out_channels)
-        
+
         # Skip connection - identity if same channels, otherwise 1x1 conv
 
         if in_channels != out_channels:
             self.skip = nn.Conv1d(in_channels, out_channels, kernel_size=1)
         else:
             self.skip = nn.Identity()
-    
+
     def forward(self, x):
         residual = self.skip(x)
         out = F.relu(self.conv1(x))
-        out = self.conv2(out) 
+        out = self.conv2(out)
         out = self.bn(out)
         out = out + residual
         return out
+
 
 class SEBlock(nn.Module):
     """
@@ -126,22 +125,23 @@ class SEBlock(nn.Module):
     def __init__(self, channels, reduction=2):
         super(SEBlock, self).__init__()
         self.global_pool = nn.AdaptiveAvgPool1d(1)
-        self.fc1 = nn.Linear(channels, channels // reduction) 
-        self.fc2 = nn.Linear(channels // reduction, channels) 
-    
+        self.fc1 = nn.Linear(channels, channels // reduction)
+        self.fc2 = nn.Linear(channels // reduction, channels)
+
     def forward(self, x):
 
         # x shape: (batch, channels, length) = (batch, channels, length)
-        
+
         # Global average pooling
         y = self.global_pool(x).squeeze(-1)  # (batch, channels)
-        
+
         y = F.relu(self.fc1(y))  # (batch, channels // reduction)
         y = torch.sigmoid(self.fc2(y))  # (batch, channels)
-        
+
         # Reshape to (batch, channels, 1) for broadcasting with (batch, channels, length)
         y = y.unsqueeze(-1)  # (batch, channels, 1)
         return x * y  # (batch, channels, length) * (batch, channels, 1) -> (batch, channels, length)
+
 
 class CNNArchitectureModel(nn.Module):
     """
@@ -154,6 +154,7 @@ class CNNArchitectureModel(nn.Module):
     def __init__(self, input_length=190, num_residual_blocks=3, use_se_block=USE_SE_BLOCK):
         super(CNNArchitectureModel, self).__init__()
         self.use_se_block = use_se_block
+        self.input_length = input_length
 
         c1 = 64
         c2 = (32, 32 * 3)  # 32 channels, 96 filters
@@ -188,7 +189,10 @@ class CNNArchitectureModel(nn.Module):
         x = F.relu(self.fc(x))
         return self.output(x)
 
-class CNNLightningModule(LightningModule):
+
+class CNNLightningModule(nn.Module):
+    """Thin wrapper around CNNArchitectureModel (no Lightning)."""
+
     def __init__(
         self,
         learning_rate=1e-3,
@@ -197,9 +201,10 @@ class CNNLightningModule(LightningModule):
         use_se_block=USE_SE_BLOCK,
     ):
         super().__init__()
-
-        self.save_hyperparameters()
         self.learning_rate = learning_rate
+        self.input_length = input_length
+        self.num_residual_blocks = num_residual_blocks
+        self.use_se_block = use_se_block
         self.model = CNNArchitectureModel(
             input_length=input_length,
             num_residual_blocks=num_residual_blocks,
@@ -209,207 +214,279 @@ class CNNLightningModule(LightningModule):
 
     def forward(self, x):
         return self.model(x)
-    
-    def training_step(self, batch, batch_idx):
-        x, y = batch
-        y_hat = self(x)
-        loss = self.criterion(y_hat, y)
+
+
+def _clone_state_dict(model):
+    return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+
+def _materialize_lazy(model, input_length, device):
+    """Run a dummy forward so LazyConv1d layers get real parameter tensors."""
+    model.eval()
+    with torch.no_grad():
+        dummy = torch.zeros(1, 1, input_length, device=device)
+        model(dummy)
+    model.train()
+
+
+def _checkpoint_path(model_dir):
+    return os.path.join(model_dir, "best_model_checkpoint.pth")
+
+
+def _legacy_checkpoint_path(model_dir):
+    return os.path.join(model_dir, "best_model_checkpoint.ckpt")
+
+
+def save_checkpoint(path, *, model, optimizer, scheduler, epoch, best_val_loss,
+                    learning_rate, input_length, num_residual_blocks, use_se_block,
+                    history):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    torch.save(
+        {
+            "model_state_dict": _clone_state_dict(model),
+            "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
+            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+            "epoch": epoch,
+            "best_val_loss": best_val_loss,
+            "learning_rate": learning_rate,
+            "input_length": input_length,
+            "num_residual_blocks": num_residual_blocks,
+            "use_se_block": use_se_block,
+            "history": history,
+        },
+        path,
+    )
+
+
+def load_model_from_checkpoint(path, device=None):
+    if device is None:
+        device = DEVICE
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+
+    if "model_state_dict" in ckpt:
+        input_length = ckpt.get("input_length", 500)
+        module = CNNLightningModule(
+            learning_rate=ckpt.get("learning_rate", 1e-3),
+            input_length=input_length,
+            num_residual_blocks=ckpt.get("num_residual_blocks", 3),
+            use_se_block=ckpt.get("use_se_block", USE_SE_BLOCK),
+        ).to(device)
+        _materialize_lazy(module, input_length, device)
+        module.model.load_state_dict(ckpt["model_state_dict"])
+        return module, ckpt
+
+    # Legacy Lightning checkpoint
+    hparams = ckpt.get("hyper_parameters", {})
+    input_length = hparams.get("input_length", 500)
+    module = CNNLightningModule(
+        learning_rate=hparams.get("learning_rate", 1e-3),
+        input_length=input_length,
+        num_residual_blocks=hparams.get("num_residual_blocks", 3),
+        use_se_block=hparams.get("use_se_block", USE_SE_BLOCK),
+    ).to(device)
+    _materialize_lazy(module, input_length, device)
+    state = {
+        k.replace("model.", "", 1): v
+        for k, v in ckpt["state_dict"].items()
+        if k.startswith("model.")
+    }
+    module.model.load_state_dict(state)
+    return module, ckpt
+
+
+def _run_epoch(model, loader, criterion, device, optimizer=None):
+    train = optimizer is not None
+    model.train(train)
+    loss_sum = 0.0
+    mae_sum = 0.0
+    n_batches = 0
+
+    for x, y in loader:
+        x = x.to(device)
+        y = y.to(device)
+        y_hat = model(x)
+        loss = criterion(y_hat, y)
         mae = F.l1_loss(y_hat, y)
-    
-        self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log('train_mae', mae, on_step=False, on_epoch=True, prog_bar=True)
 
-        return loss
-    
-    def validation_step(self, batch, batch_idx):
-        x, y = batch
-        y_hat = self(x)
-        loss = self.criterion(y_hat, y)
-        mae = F.l1_loss(y_hat, y)
-        
-        self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log('val_mae', mae, on_step=False, on_epoch=True, prog_bar=True)
+        if train:
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
+            optimizer.step()
 
-        return loss
-    
-    def test_step(self, batch, batch_idx):
-        x, y = batch
-        y_hat = self(x)
-        loss = self.criterion(y_hat, y)
-        mae = F.l1_loss(y_hat, y)
-        
-        self.log('test_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log('test_mae', mae, on_step=False, on_epoch=True, prog_bar=True)
+        loss_sum += loss.item()
+        mae_sum += mae.item()
+        n_batches += 1
 
-        return loss
-    
-    def configure_optimizers(self):
-        optimizer = optim.AdamW(
-            self.parameters(),
-            lr=self.learning_rate,
-            betas=(0.9, 0.999),
-            eps=1e-8,
-            weight_decay=1e-5
-        )
-
-        # ReduceLROnPlateau never raises the LR, so val_mae declines monotonically
-        # instead of spiking on every warm-restart cycle.
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode='min',
-            factor=0.5,
-            patience=20,
-            min_lr=1e-5,
-        )
-
-        return {
-            'optimizer': optimizer,
-            'lr_scheduler': {
-                'scheduler': scheduler,
-                'monitor': 'val_loss',
-                'interval': 'epoch',
-                'frequency': 1,
-            }
-        }
+    n = max(n_batches, 1)
+    return loss_sum / n, mae_sum / n
 
 
-class LossHistoryCallback(Callback):
-    """Records epoch train_loss and val_loss and saves to CSV at end of training."""
-    def __init__(self, save_path):
-        super().__init__()
-        self.save_path = save_path
-        self.epoch_train_loss = []
-        self.epoch_val_loss = []
-        self.epoch_train_mae = []
-        self.epoch_val_mae = []
+def train_model(X_train, y_train, X_val, y_val, X_test, y_test,
+                model_dir, performance_dir, version,
+                learning_rate=1e-3, max_epochs=2000, input_length=190, batch_size=256,
+                device=None):
 
-    def on_validation_epoch_end(self, trainer, pl_module):
-        metrics = trainer.callback_metrics
-        if 'train_loss' in metrics:
-            self.epoch_train_loss.append(float(metrics['train_loss'].cpu()))
-        if 'val_loss' in metrics:
-            self.epoch_val_loss.append(float(metrics['val_loss'].cpu()))
-        if 'train_mae' in metrics:
-            self.epoch_train_mae.append(float(metrics['train_mae'].cpu()))
-        if 'val_mae' in metrics:
-            self.epoch_val_mae.append(float(metrics['val_mae'].cpu()))
-
-    def on_fit_end(self, trainer, pl_module):
-        if not self.epoch_train_loss and not self.epoch_val_loss:
-            return
-        os.makedirs(os.path.dirname(self.save_path), exist_ok=True)
-        n = max(len(self.epoch_train_loss), len(self.epoch_val_loss))
-        # Pad shorter list so we have one row per epoch
-        train_loss = self.epoch_train_loss + [None] * (n - len(self.epoch_train_loss))
-        val_loss = self.epoch_val_loss + [None] * (n - len(self.epoch_val_loss))
-        train_mae = self.epoch_train_mae + [None] * (n - len(self.epoch_train_mae))
-        val_mae = self.epoch_val_mae + [None] * (n - len(self.epoch_val_mae))
-        history_df = pd.DataFrame({
-            'epoch': range(1, n + 1),
-            'train_loss': train_loss,
-            'val_loss': val_loss,
-            'train_mae': train_mae,
-            'val_mae': val_mae,
-        })
-        history_df.to_csv(self.save_path, index=False)
-        print(f"Saved loss and validation loss to {self.save_path}")
-
-
-def train_model(X_train, y_train, X_val, y_val, X_test, y_test, 
-                model_dir, performance_dir, version, 
-                learning_rate=1e-3, max_epochs=2000, input_length=190, batch_size=256):
-    
+    if device is None:
+        device = DEVICE
     pin_memory = torch.cuda.is_available()
 
-    train_dataset = NMRDataset(X_train, y_train)
-    val_dataset = NMRDataset(X_val, y_val)
-    test_dataset = NMRDataset(X_test, y_test)
-    
     train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        shuffle=True, 
-        pin_memory=pin_memory, 
+        NMRDataset(X_train, y_train),
+        batch_size=batch_size,
+        shuffle=True,
+        pin_memory=pin_memory,
     )
     val_loader = DataLoader(
-        val_dataset, 
-        batch_size=batch_size, 
-        shuffle=False, 
-        pin_memory=pin_memory, 
+        NMRDataset(X_val, y_val),
+        batch_size=batch_size,
+        shuffle=False,
+        pin_memory=pin_memory,
     )
     test_loader = DataLoader(
-        test_dataset, 
-        batch_size=batch_size, 
-        shuffle=False, 
-        pin_memory=pin_memory, 
+        NMRDataset(X_test, y_test),
+        batch_size=batch_size,
+        shuffle=False,
+        pin_memory=pin_memory,
     )
-    
-    checkpoint_path = f"{model_dir}/best_model_checkpoint.ckpt"
-    model_path = f"{model_dir}/best_model.ckpt"
-    
-    if os.path.exists(checkpoint_path):
-        print(f"Loading existing model checkpoint from {checkpoint_path}")
-        model = CNNLightningModule.load_from_checkpoint(checkpoint_path)
-        print("Model loaded successfully. Continuing training...")
-    elif os.path.exists(model_path):
-        print(f"Loading existing model from {model_path}")
-        model = CNNLightningModule.load_from_checkpoint(model_path)
-        print("Model loaded successfully. Continuing training...")
+
+    ckpt_path = _checkpoint_path(model_dir)
+    legacy_ckpt = _legacy_checkpoint_path(model_dir)
+    legacy_model = f"{model_dir}/best_model.ckpt"
+    resume_path = None
+    for candidate in (ckpt_path, legacy_ckpt, legacy_model):
+        if os.path.isfile(candidate):
+            resume_path = candidate
+            break
+
+    resume_ckpt = None
+    if resume_path is not None:
+        print(f"Loading existing model checkpoint from {resume_path}", flush=True)
+        model, resume_ckpt = load_model_from_checkpoint(resume_path, device=device)
+        model.learning_rate = learning_rate
+        print("Model loaded successfully. Continuing training...", flush=True)
     else:
-        print("No existing model found. Building new model...")
-        model = CNNLightningModule(learning_rate=learning_rate, input_length=input_length)
-    
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=model_dir,
-        filename='best_model_checkpoint',
-        monitor='val_loss',
-        save_top_k=1,
+        print("No existing model found. Building new model...", flush=True)
+        model = CNNLightningModule(
+            learning_rate=learning_rate,
+            input_length=input_length,
+        ).to(device)
+        _materialize_lazy(model, input_length, device)
+
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f'Trainable parameters: {n_trainable:,}', flush=True)
+
+    criterion = nn.MSELoss()
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=learning_rate,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=1e-5,
+    )
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
         mode='min',
-        save_last=True
+        factor=0.5,
+        patience=20,
+        min_lr=1e-5,
     )
-    
-    loss_history_path = f"{performance_dir}/{version}_loss.csv"
-    loss_history_callback = LossHistoryCallback(save_path=loss_history_path)
-    
-    csv_logger = CSVLogger(performance_dir, name='training_log')
-    
-    trainer_kwargs = {
-        'max_epochs': max_epochs,
-        'callbacks': [
-            # EarlyStopping(monitor='val_loss', patience=50, mode='min'),
-            checkpoint_callback,
-            LearningRateMonitor(),
-            loss_history_callback,
-        ],
-        'logger': csv_logger,
-        'enable_progress_bar': True
+
+    history = {
+        'train_loss': [],
+        'val_loss': [],
+        'train_mae': [],
+        'val_mae': [],
     }
-    
-    trainer_kwargs["accelerator"] = ACCELERATOR
-    trainer_kwargs["devices"] = N_DEVICES
-    trainer_kwargs['gradient_clip_val'] = 1.0
-    
-    trainer = Trainer(**trainer_kwargs)
-    
-    trainer.fit(model, train_loader, val_loader)
-    
+    start_epoch = 0
+    best_val_loss = float('inf')
+    best_state = _clone_state_dict(model.model)
+
+    if resume_ckpt is not None and "model_state_dict" in resume_ckpt:
+        if resume_ckpt.get("optimizer_state_dict") is not None:
+            try:
+                optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
+            except (ValueError, KeyError) as exc:
+                print(f"Could not restore optimizer state ({exc}); continuing with fresh optimizer.", flush=True)
+        if resume_ckpt.get("scheduler_state_dict") is not None:
+            try:
+                scheduler.load_state_dict(resume_ckpt["scheduler_state_dict"])
+            except (ValueError, KeyError) as exc:
+                print(f"Could not restore scheduler state ({exc}); continuing with fresh scheduler.", flush=True)
+        for pg in optimizer.param_groups:
+            pg['lr'] = learning_rate
+        start_epoch = int(resume_ckpt.get("epoch", 0))
+        best_val_loss = float(resume_ckpt.get("best_val_loss", float('inf')))
+        if resume_ckpt.get("history"):
+            for col, values in resume_ckpt["history"].items():
+                if col in history and values:
+                    history[col] = list(values)
+
     best_pth_path = f"{model_dir}/best_model.pth"
-    best_ckpt = checkpoint_callback.best_model_path
-    if best_ckpt and os.path.isfile(best_ckpt):
-        best_module = CNNLightningModule.load_from_checkpoint(best_ckpt)
-        torch.save(best_module.model.state_dict(), best_pth_path)
-        print(f"Saved best model (lowest val_loss) weights to {best_pth_path}")
-    else:
+    loss_history_path = f"{performance_dir}/{version}_loss.csv"
+
+    for epoch in range(start_epoch, max_epochs):
+        train_loss, train_mae = _run_epoch(
+            model, train_loader, criterion, device, optimizer=optimizer
+        )
+        val_loss, val_mae = _run_epoch(
+            model, val_loader, criterion, device, optimizer=None
+        )
+        scheduler.step(val_loss)
+        lr = optimizer.param_groups[0]['lr']
+
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
+        history['train_mae'].append(train_mae)
+        history['val_mae'].append(val_mae)
+
+        print(
+            f'epoch {epoch + 1:03d}/{max_epochs} | train {train_loss:.6f} | val {val_loss:.6f} | '
+            f'train_mae {train_mae:.6f} | val_mae {val_mae:.6f} | lr {lr:.2e}',
+            flush=True,
+        )
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = _clone_state_dict(model.model)
+            save_checkpoint(
+                ckpt_path,
+                model=model.model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                epoch=epoch + 1,
+                best_val_loss=best_val_loss,
+                learning_rate=learning_rate,
+                input_length=input_length,
+                num_residual_blocks=model.num_residual_blocks,
+                use_se_block=model.use_se_block,
+                history=history,
+            )
+            torch.save(best_state, best_pth_path)
+            print(f"Saved best model (lowest val_loss) weights to {best_pth_path}", flush=True)
+
+    os.makedirs(os.path.dirname(loss_history_path) or ".", exist_ok=True)
+    n = max(len(history['train_loss']), 1)
+    pd.DataFrame({
+        'epoch': range(1, n + 1),
+        'train_loss': history['train_loss'] + [None] * (n - len(history['train_loss'])),
+        'val_loss': history['val_loss'] + [None] * (n - len(history['val_loss'])),
+        'train_mae': history['train_mae'] + [None] * (n - len(history['train_mae'])),
+        'val_mae': history['val_mae'] + [None] * (n - len(history['val_mae'])),
+    }).to_csv(loss_history_path, index=False)
+    print(f"Saved loss and validation loss to {loss_history_path}", flush=True)
+
+    if best_state is not None:
+        model.model.load_state_dict(best_state)
+    if not os.path.isfile(best_pth_path):
         torch.save(model.model.state_dict(), best_pth_path)
         print(
             f"Saved model weights to {best_pth_path} "
-            f"(no best checkpoint path; using weights at end of training)"
+            f"(no best checkpoint path; using weights at end of training)",
+            flush=True,
         )
 
-    # Reload best weights for test/evaluation when a best checkpoint exists
-    if best_ckpt and os.path.isfile(best_ckpt):
-        model = CNNLightningModule.load_from_checkpoint(best_ckpt)
+    test_loss, test_mae = _run_epoch(model, test_loader, criterion, device, optimizer=None)
+    print(f'test | loss {test_loss:.6f} | mae {test_mae:.6f}', flush=True)
 
-    trainer.test(model, test_loader)
-    
-    return model, trainer
+    return model, history

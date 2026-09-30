@@ -7,5 +7,4 @@ pyyaml
 tqdm
 scikit-learn
 torch
-pytorch-lightning
 tensorboard

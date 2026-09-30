@@ -1,13 +1,9 @@
 from typing import Tuple
 
-import torch 
+import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.utils.data as data
-import lightning as L
-from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint, RichProgressBar, StochasticWeightAveraging
-from lightning.pytorch.callbacks.progress.rich_progress import RichProgressBarTheme
-from lightning.pytorch.loggers import TensorBoardLogger
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -15,26 +11,29 @@ import random
 import sys
 import os
 import pickle
-import gc 
+import gc
 from sklearn.preprocessing import MinMaxScaler
-
-from stable_minmax import StableMinMaxScaler
 
 sys.stdout.flush()
 sys.stderr.flush()
 
-NUM_EPOCHS = 500 
+NUM_EPOCHS = 500
 BATCH_SIZE = 64
 LEARNING_RATE = 1e-2
 DEFAULT_NOISE_FACTOR = 3 * 2.690506959957014e-05
-LOSS_PROG_BAR_FORMAT = ".8f"
+MAX_GRAD_NORM = 1.0
+EARLY_STOP_PATIENCE = 20
 
-if torch.backends.mps.is_available():
-    device = torch.device("mps")
-    trainer_accelerator = "mps"
-else:
-    device = torch.device("cpu")
-    trainer_accelerator = "cpu"
+
+def _device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+DEVICE = _device()
 
 
 class DenoisingAutoencoder(nn.Module):
@@ -79,7 +78,7 @@ class DenoisingAutoencoder(nn.Module):
         return self.decoder(z)
 
 
-class AE(L.LightningModule):
+class AE(nn.Module):
     def __init__(
         self,
         noise_factor=DEFAULT_NOISE_FACTOR,
@@ -126,82 +125,78 @@ class AE(L.LightningModule):
         x = x.view(x.size(0), -1)
         return self.net(x)
 
-    def training_step(self, batch, batch_idx):
+
+def _clone_state_dict(model):
+    return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+
+def train_epoch(model, loader, optimizer, loss_fn, device):
+    model.train()
+    total_loss = 0.0
+    n_batches = 0
+    for batch in loader:
         x, _, _ = batch
-        x = x.view(x.size(0), -1)
+        x = x.to(device).view(x.size(0), -1)
         x_clean_scaled = x.clone()
-        x_noisy_scaled = self.noisy_scaled_batch(x_clean_scaled)
+        x_noisy_scaled = model.noisy_scaled_batch(x_clean_scaled)
 
-        decoded = self.forward(x_noisy_scaled)
+        optimizer.zero_grad()
+        decoded = model(x_noisy_scaled)
+        loss = loss_fn(decoded, x_clean_scaled)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
+        optimizer.step()
 
-        train_loss = nn.functional.mse_loss(decoded, x_clean_scaled)
+        total_loss += loss.item()
+        n_batches += 1
+    return total_loss / n_batches if n_batches > 0 else 0.0
 
-        self.log('train_loss', train_loss, on_step=False, on_epoch=True, prog_bar=True)
-        return train_loss
 
-    def validation_step(self, batch, batch_idx):
-        x, _, _ = batch
-        x = x.view(x.size(0), -1)
-        x_clean_scaled = x.clone()
-        x_noisy_scaled = self.noisy_scaled_batch(x_clean_scaled)
-
-        decoded = self.forward(x_noisy_scaled)
-
-        val_loss = nn.functional.mse_loss(decoded, x_clean_scaled)
-
-        self.log('val_loss', val_loss, on_step=False, on_epoch=True, prog_bar=True)
-        return val_loss
-
-    def test_step(self, batch, batch_idx):
-        x, _, _ = batch
-        x = x.view(x.size(0), -1)
-        x_clean_scaled = x.clone()
-        x_noisy_scaled = self.noisy_scaled_batch(x_clean_scaled)
-
-        decoded = self.forward(x_noisy_scaled)
-
-        test_loss = nn.functional.mse_loss(decoded, x_clean_scaled)
-
-        self.log('test_loss', test_loss, on_step=False, on_epoch=True, prog_bar=True)
-        return test_loss
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(
-            self.parameters(),
-            lr=LEARNING_RATE,
-            weight_decay=1e-4,
-            betas=(0.9, 0.999),
-            eps=1e-8,
-            amsgrad=True,
-        )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer, T_0=10, T_mult=2, eta_min=max(1e-8, LEARNING_RATE * 1e-4)
-        )
-        return [optimizer], [scheduler]
+def evaluate(model, loader, loss_fn, device):
+    model.eval()
+    total_loss = 0.0
+    n_batches = 0
+    with torch.no_grad():
+        for batch in loader:
+            x, _, _ = batch
+            x = x.to(device).view(x.size(0), -1)
+            x_clean_scaled = x.clone()
+            x_noisy_scaled = model.noisy_scaled_batch(x_clean_scaled)
+            decoded = model(x_noisy_scaled)
+            loss = loss_fn(decoded, x_clean_scaled)
+            total_loss += loss.item()
+            n_batches += 1
+    return total_loss / n_batches if n_batches > 0 else 0.0
 
 
 if __name__ == '__main__':
+    from stable_minmax import StableMinMaxScaler
+
     SEED = 42
 
     torch.set_default_dtype(torch.float32)
-    L.seed_everything(SEED, workers=True)
     torch.manual_seed(SEED)
     np.random.seed(SEED)
     random.seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
 
-    version = 'Exp2_DAE_V1' 
+    version = 'Exp2_DAE_V1'
 
-    performance_dir = f"Model_Performance/{version}"  
-    model_dir = f"Models/{version}"  
+    performance_dir = f"Model_Performance/{version}"
+    model_dir = f"Models/{version}"
     os.makedirs(performance_dir, exist_ok=True)
     os.makedirs(model_dir, exist_ok=True)
+
+    device = DEVICE
+    print(f'Using device: {device}', flush=True)
 
     df = pd.read_parquet("Exp2_DAE.parquet")
 
     X = df.drop(columns=["P", 'SNR', 'Area']).values
     area = df["Area"].values
-    P = df["P"].values 
-    SNR = df["SNR"].values  
+    P = df["P"].values
+    SNR = df["SNR"].values
 
     P = P.reshape(-1, 1)
     area = area.reshape(-1, 1)
@@ -221,83 +216,125 @@ if __name__ == '__main__':
     with open(f"{performance_dir}/{version}_scaler_area.pkl", 'wb') as f:
         pickle.dump(Area_Scaler, f)
 
-    print(f"Shape of X: {X.shape}")
-    print(f"Range of X: {X.min():.4f} to {X.max():.4f}")
-    print(f"Range of P: {P.min():.4f} to {P.max():.4f}")
-    print(f"Range of area: {area.min():.4f} to {area.max():.4f}")
+    print(f"Shape of X: {X.shape}", flush=True)
+    print(f"Range of X: {X.min():.4f} to {X.max():.4f}", flush=True)
+    print(f"Range of P: {P.min():.4f} to {P.max():.4f}", flush=True)
+    print(f"Range of area: {area.min():.4f} to {area.max():.4f}", flush=True)
 
-    dataset = data.TensorDataset(torch.tensor(X, dtype=torch.float32), torch.tensor(P, dtype=torch.float32), torch.tensor(area, dtype=torch.float32))
+    dataset = data.TensorDataset(
+        torch.tensor(X, dtype=torch.float32),
+        torch.tensor(P, dtype=torch.float32),
+        torch.tensor(area, dtype=torch.float32),
+    )
 
     del df, X, P, area
     gc.collect()
 
     train_dataset, val_dataset, test_dataset = data.random_split(dataset, [0.80, 0.10, 0.10])
 
-    train_loader = data.DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=13, persistent_workers=True)
-    val_loader = data.DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=13, persistent_workers=True)
-    test_loader = data.DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=13, persistent_workers=True)
+    num_workers = min(13, os.cpu_count() or 0)
+    loader_kwargs = {"batch_size": BATCH_SIZE}
+    if num_workers > 0:
+        loader_kwargs.update({"num_workers": num_workers, "persistent_workers": True})
 
-    rich_progress = RichProgressBar(
-        theme=RichProgressBarTheme(
-            description="green_yellow",
-            progress_bar="green1",
-            progress_bar_finished="green1",
-            progress_bar_pulse="#6206E0",
-            batch_progress="green_yellow",
-            time="grey82",
-            processing_speed="grey82",
-            metrics="grey82",
-            metrics_format=LOSS_PROG_BAR_FORMAT,
+    train_loader = data.DataLoader(train_dataset, shuffle=True, **loader_kwargs)
+    val_loader = data.DataLoader(val_dataset, shuffle=False, **loader_kwargs)
+    test_loader = data.DataLoader(test_dataset, shuffle=False, **loader_kwargs)
+
+    model = AE(noise_factor=DEFAULT_NOISE_FACTOR, scaler=X_Scaler).to(device)
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f'Trainable parameters: {n_trainable:,}', flush=True)
+
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=LEARNING_RATE,
+        weight_decay=1e-4,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        amsgrad=True,
+    )
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=10, T_mult=2, eta_min=max(1e-8, LEARNING_RATE * 1e-4)
+    )
+    loss_fn = nn.MSELoss()
+
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
+    best_state = None
+    history = {'train_loss': [], 'val_loss': []}
+
+    print('Training DAE model...', flush=True)
+    for epoch in range(NUM_EPOCHS):
+        train_loss = train_epoch(model, train_loader, optimizer, loss_fn, device)
+        val_loss = evaluate(model, val_loader, loss_fn, device)
+        scheduler.step()
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
+
+        print(
+            f'Epoch {epoch + 1}: train={train_loss:.6f} val={val_loss:.6f} '
+            f'lr={scheduler.get_last_lr()[0]:.2e}',
+            flush=True,
         )
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            epochs_no_improve = 0
+            best_state = _clone_state_dict(model)
+            torch.save(
+                {
+                    'model_state_dict': best_state,
+                    'noise_factor': model.noise_factor,
+                    'input_dim': model.input_dim,
+                    'hidden_dims': model.hidden_dims,
+                    'best_val_loss': best_val_loss,
+                    'epoch': epoch + 1,
+                },
+                f"{model_dir}/best_model_checkpoint.pth",
+            )
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= EARLY_STOP_PATIENCE:
+                print(f'Early stop at epoch {epoch + 1} (best val {best_val_loss:.6f})', flush=True)
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    pd.DataFrame({
+        'epoch': range(1, len(history['train_loss']) + 1),
+        'train_loss': history['train_loss'],
+        'val_loss': history['val_loss'],
+    }).to_csv(f"{performance_dir}/{version}_loss.csv", index=False)
+
+    final_model_path = f"{model_dir}/{version}_final_model.pth"
+    torch.save(
+        {
+            'model_state_dict': _clone_state_dict(model),
+            'noise_factor': model.noise_factor,
+            'input_dim': model.input_dim,
+            'hidden_dims': model.hidden_dims,
+            'best_val_loss': best_val_loss,
+        },
+        final_model_path,
     )
+    print(f"\nFinal model saved to: {final_model_path}", flush=True)
 
-    trainer = L.Trainer(
-        max_epochs=NUM_EPOCHS, 
-        callbacks=[
-            rich_progress,
-            EarlyStopping(monitor='val_loss', patience=20, mode='min'),
-            ModelCheckpoint(monitor='val_loss', mode='min', save_top_k=1, save_last=True, 
-                          dirpath=model_dir, filename='best_model-{epoch:02d}-{val_loss:.8f}'),
-            # Early SWA + warm restarts made val_loss sit near the ~1/12 "mean predictor" floor in practice.
-            StochasticWeightAveraging(swa_lrs=min(LEARNING_RATE, 1e-3), swa_epoch_start=max(10, int(NUM_EPOCHS * 0.75)))
-        ],
-        logger=TensorBoardLogger(save_dir=performance_dir, name=version),
-        enable_progress_bar=True,
-        devices=1,
-        accelerator=trainer_accelerator,
-        precision='32',  
-        deterministic=True
-    )
-
-
-    with trainer.init_module():
-        model = AE(noise_factor=DEFAULT_NOISE_FACTOR, scaler=X_Scaler)
-        
-    trainer.fit(model, train_loader, val_loader)
-
-    final_model_path = f"{model_dir}/{version}_final_model.ckpt"
-    trainer.save_checkpoint(final_model_path)
-    print(f"\nFinal model saved to: {final_model_path}")
-    
     state_dict_path = f"{model_dir}/{version}_state_dict.pth"
     torch.save(model.state_dict(), state_dict_path)
-    print(f"Model state dict saved to: {state_dict_path}")
+    print(f"Model state dict saved to: {state_dict_path}", flush=True)
 
-    test_results = trainer.test(model, test_loader)
+    test_loss = evaluate(model, test_loader, loss_fn, device)
+    print(f'\nTest MSE (normalized): {test_loss:.6f}', flush=True)
 
-    print("\nCollecting test predictions for analysis...")
-    model_to_eval = trainer.model
-    if hasattr(model_to_eval, 'module'):
-        model_to_eval = model_to_eval.module
-
-    model_to_eval.eval()
-    model_to_eval = model_to_eval.to(device)
+    print("\nCollecting test predictions for analysis...", flush=True)
+    model.eval()
+    model = model.to(device)
     test_X_actual = []
     test_X_noisy = []
     test_X_predicted = []
     test_P = []
     test_area = []
-    test_SNR = []
     test_reconstruction_errors = []
 
     with torch.no_grad():
@@ -306,20 +343,20 @@ if __name__ == '__main__':
             x = x.to(device)
             x_clean_scaled = x.clone().view(x.size(0), -1)
 
-            x_noisy_scaled = model_to_eval.noisy_scaled_batch(x_clean_scaled)
+            x_noisy_scaled = model.noisy_scaled_batch(x_clean_scaled)
 
-            decoded_scaled = model_to_eval.forward(x_noisy_scaled)
-            
-            x_clean_unscaled = model_to_eval.unscale_with_scaler(x_clean_scaled)
-            x_noisy_unscaled = model_to_eval.unscale_with_scaler(x_noisy_scaled)
-            decoded_unscaled = model_to_eval.unscale_with_scaler(decoded_scaled)
+            decoded_scaled = model.forward(x_noisy_scaled)
+
+            x_clean_unscaled = model.unscale_with_scaler(x_clean_scaled)
+            x_noisy_unscaled = model.unscale_with_scaler(x_noisy_scaled)
+            decoded_unscaled = model.unscale_with_scaler(decoded_scaled)
 
             x_clean_np = x_clean_unscaled.cpu().numpy()
             x_noisy_np = x_noisy_unscaled.cpu().numpy()
             decoded_np = decoded_unscaled.cpu().numpy()
-            
+
             reconstruction_error = np.mean((decoded_np - x_clean_np) ** 2, axis=1)
-            
+
             test_X_actual.append(x_clean_np)
             test_X_noisy.append(x_noisy_np)
             test_X_predicted.append(decoded_np)
@@ -342,8 +379,8 @@ if __name__ == '__main__':
     test_X_predicted_unscaled = test_X_predicted
 
     noise_mag_phys = np.mean(np.abs(test_X_noisy_unscaled - test_X_actual_unscaled))
-    print(f"\nNoise verification (physical units): mean |noisy - clean| = {noise_mag_phys:.6f}")
-    print(f"Noise std (raw spectrum units, before scaling): {model_to_eval.noise_factor}")
+    print(f"\nNoise verification (physical units): mean |noisy - clean| = {noise_mag_phys:.6f}", flush=True)
+    print(f"Noise std (raw spectrum units, before scaling): {model.noise_factor}", flush=True)
     # example plot with noisy input shown
     plt.figure(figsize=(16, 12))
     plt.style.use('ggplot')
@@ -357,7 +394,7 @@ if __name__ == '__main__':
     plt.tight_layout()
     plt.savefig(f"{performance_dir}/{version}_reconstruction_example.pdf", dpi=1200)
     plt.close()
-    print(f"Reconstruction example saved to {performance_dir}/{version}_reconstruction_example.pdf")
+    print(f"Reconstruction example saved to {performance_dir}/{version}_reconstruction_example.pdf", flush=True)
 
     mse_per_sample_unscaled = np.mean((test_X_predicted_unscaled - test_X_actual_unscaled) ** 2, axis=1)
     mae_per_sample = np.mean(np.abs(test_X_predicted_unscaled - test_X_actual_unscaled), axis=1)
@@ -369,12 +406,10 @@ if __name__ == '__main__':
 
     mean_residual = np.mean(test_X_predicted_unscaled - test_X_actual_unscaled)
     std_residual = np.std(test_X_predicted_unscaled - test_X_actual_unscaled)
-    print(f"Mean residual: {mean_residual:.6e}")
-    print(f"Std residual: {std_residual:.6e}")
+    print(f"Mean residual: {mean_residual:.6e}", flush=True)
+    print(f"Std residual: {std_residual:.6e}", flush=True)
 
-    # rre_90 = rre[rre < np.percentile(rre, 90)]
-
-    print("\nSaving results...")
+    print("\nSaving results...", flush=True)
     results_data = {
         'Reconstruction_MSE': mse_per_sample_unscaled,
         'Reconstruction_MAE': mae_per_sample,
@@ -387,10 +422,9 @@ if __name__ == '__main__':
         'Std_Residual': std_residual,
     }
 
-
     results = pd.DataFrame(results_data)
     results.to_csv(f"{performance_dir}/{version}_results.csv", index=False)
-    print(f"Results saved to {performance_dir}/{version}_results.csv")
+    print(f"Results saved to {performance_dir}/{version}_results.csv", flush=True)
 
     plt.style.use('seaborn-v0_8')
     plt.figure(figsize=(10, 6))
@@ -404,5 +438,5 @@ if __name__ == '__main__':
     plt.tight_layout()
     plt.savefig(f"{performance_dir}/{version}_rre_histogram.png", dpi=600)
     plt.close()
-    print(f"RRE histogram saved to {performance_dir}/{version}_rre_histogram.png")
-    
+    print(f"RRE histogram saved to {performance_dir}/{version}_rre_histogram.png", flush=True)
+    print('Done.', flush=True)

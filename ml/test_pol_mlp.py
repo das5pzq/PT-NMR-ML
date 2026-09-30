@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from pol_mlp import FFLightningModule
+from pol_mlp import FFLightningModule, load_model_from_checkpoint
 
 ML_DIR = Path(__file__).resolve().parent
 REPO_ROOT = ML_DIR.parent
@@ -34,9 +34,8 @@ def load_records(path: Path) -> list[dict]:
 def load_model(checkpoint_path: Path, device: torch.device) -> FFLightningModule:
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    model = FFLightningModule.load_from_checkpoint(str(checkpoint_path))
+    model, _ = load_model_from_checkpoint(str(checkpoint_path), device=device)
     model.eval()
-    model.to(device)
     return model
 
 
@@ -222,7 +221,15 @@ def main() -> None:
     performance_dir = ML_DIR / "Model_Performance" / version
     model_dir = ML_DIR / "Models" / version
 
-    checkpoint_path = args.checkpoint or (model_dir / "best_model_checkpoint.ckpt")
+    if args.checkpoint is not None:
+        checkpoint_path = args.checkpoint
+    else:
+        candidates = (
+            model_dir / "best_model_checkpoint.pth",
+            model_dir / "best_model_checkpoint.ckpt",
+            model_dir / "best_model.pth",
+        )
+        checkpoint_path = next((p for p in candidates if p.is_file()), candidates[0])
     scaler_path = args.scaler_path or (performance_dir / f"{version}_scaler.pkl")
     output_dir = args.output_dir or (performance_dir / "data_test")
     stem = args.data_path.stem

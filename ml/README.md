@@ -22,7 +22,7 @@ Run all commands from the **`ml/`** directory unless noted otherwise.
 | `area.py` | Spin-1/2 **signal area** | Small MLP (or linear ridge if `HIDDEN = []`). Supports `--data_file` and `--reload`. |
 | `dae.py` | — | **Denoising autoencoder**: reconstructs clean lineshapes from noisy input. |
 
-Model definitions live in the same files as the training loops (`pol_mlp.py` defines `FFLightningModule`, etc.).
+Model definitions live in the same files as the training loops (`pol_mlp.py` defines `SimpleFeedForward` / `FFLightningModule`, etc.). Training uses plain PyTorch loops (no Lightning) with terminal epoch logging and a trainable-parameter count printed before training starts.
 
 ---
 

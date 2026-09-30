@@ -134,18 +134,28 @@ def load_model(model_path: str, device: torch.device) -> torch.nn.Module:
         }
         model.load_state_dict(state)
     else:
-        state = torch.load(model_path, map_location=device, weights_only=True)
-        if "trunk.0.weight" in state:
-            hidden_dim, input_dim = state["trunk.0.weight"].shape
-        elif "input_proj.weight" in state:
-            hidden_dim, input_dim = state["input_proj.weight"].shape
+        payload = torch.load(model_path, map_location=device, weights_only=False)
+        if isinstance(payload, dict) and "model_state_dict" in payload:
+            state = payload["model_state_dict"]
+            input_dim = payload.get("input_dim")
+            hidden_dim = payload.get("hidden_dim")
+            if input_dim is None or hidden_dim is None:
+                hidden_dim, input_dim = state["trunk.0.weight"].shape
+            model = SimpleFeedForward(input_dim=input_dim, hidden_dim=hidden_dim)
+            model.load_state_dict(state)
         else:
-            hidden_dim, input_dim = state["net.0.weight"].shape
-        model = SimpleFeedForward(
-            input_dim=input_dim,
-            hidden_dim=hidden_dim,
-        )
-        model.load_state_dict(state)
+            state = payload
+            if "trunk.0.weight" in state:
+                hidden_dim, input_dim = state["trunk.0.weight"].shape
+            elif "input_proj.weight" in state:
+                hidden_dim, input_dim = state["input_proj.weight"].shape
+            else:
+                hidden_dim, input_dim = state["net.0.weight"].shape
+            model = SimpleFeedForward(
+                input_dim=input_dim,
+                hidden_dim=hidden_dim,
+            )
+            model.load_state_dict(state)
 
     model.to(device)
     model.eval()
