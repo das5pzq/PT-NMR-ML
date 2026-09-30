@@ -11,7 +11,7 @@ import warnings
 warnings.filterwarnings('ignore')
 import sys
 
-POLARIZATION_RANGE = "HIGH_POL"  # Options: HIGH_POL (2% - 60), LOW_POL (TE - 2%)
+POLARIZATION_RANGE = "HIGH_POL"
 USE_SE_BLOCK = POLARIZATION_RANGE == "HIGH_POL"
 MAX_GRAD_NORM = 1.0
 
@@ -37,8 +37,6 @@ DEVICE = _device()
 
 
 class NMRDataset(Dataset):
-    """Buffers X, y as NumPy float32; __getitem__ uses torch.from_numpy (no full tensor copy)."""
-
     def __init__(self, X, y):
         self.X = np.ascontiguousarray(X, dtype=np.float32)
         self.y = np.ascontiguousarray(y, dtype=np.float32)
@@ -51,16 +49,12 @@ class NMRDataset(Dataset):
         return self.X.shape[0]
 
     def __getitem__(self, idx):
-        # (length,) -> (1, length) for Conv1d; row is a view, no copy until collate stacks batches.
         x_row = torch.from_numpy(self.X[idx]).unsqueeze(0)
         y_row = torch.from_numpy(self.y[idx])
         return x_row, y_row
 
 
 class InceptionBlock(nn.Module):
-    """
-    Inception block with four parallel Conv1D layers (kernel sizes 1, 3, 5, 3 + max pool) -> concatenate
-    """
     def __init__(self, c1, c2, c3, c4):
         super(InceptionBlock, self).__init__()
         self.branch1 = nn.Sequential(
@@ -93,17 +87,11 @@ class InceptionBlock(nn.Module):
 
 
 class ResidualBlock(nn.Module):
-
-    """Residual block with two Conv1D layers and batch normalization"""
-
     def __init__(self, in_channels, out_channels):
         super(ResidualBlock, self).__init__()
         self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1)
         self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1)
         self.bn = nn.BatchNorm1d(out_channels)
-
-        # Skip connection - identity if same channels, otherwise 1x1 conv
-
         if in_channels != out_channels:
             self.skip = nn.Conv1d(in_channels, out_channels, kernel_size=1)
         else:
@@ -119,9 +107,6 @@ class ResidualBlock(nn.Module):
 
 
 class SEBlock(nn.Module):
-    """
-    Squeeze-and-Excitation block
-    """
     def __init__(self, channels, reduction=2):
         super(SEBlock, self).__init__()
         self.global_pool = nn.AdaptiveAvgPool1d(1)
@@ -129,61 +114,40 @@ class SEBlock(nn.Module):
         self.fc2 = nn.Linear(channels // reduction, channels)
 
     def forward(self, x):
-
-        # x shape: (batch, channels, length) = (batch, channels, length)
-
-        # Global average pooling
-        y = self.global_pool(x).squeeze(-1)  # (batch, channels)
-
-        y = F.relu(self.fc1(y))  # (batch, channels // reduction)
-        y = torch.sigmoid(self.fc2(y))  # (batch, channels)
-
-        # Reshape to (batch, channels, 1) for broadcasting with (batch, channels, length)
-        y = y.unsqueeze(-1)  # (batch, channels, 1)
-        return x * y  # (batch, channels, length) * (batch, channels, 1) -> (batch, channels, length)
+        y = self.global_pool(x).squeeze(-1)
+        y = F.relu(self.fc1(y))
+        y = torch.sigmoid(self.fc2(y))
+        y = y.unsqueeze(-1)
+        return x * y
 
 
 class CNNArchitectureModel(nn.Module):
-    """
-    Architecture:
-    1. Inception block (4 parallel Conv1D layers (kernel sizes 1, 3, 5, 3 + max pool)) -> concatenate
-    2. Residual blocks (2 Conv1D layers each)
-    3. Optional SE (Squeeze-and-Excitation) block (LOW_POL only)
-    4. Global average pooling -> FC + ReLU -> output
-    """
     def __init__(self, input_length=190, num_residual_blocks=3, use_se_block=USE_SE_BLOCK):
         super(CNNArchitectureModel, self).__init__()
         self.use_se_block = use_se_block
         self.input_length = input_length
 
         c1 = 64
-        c2 = (32, 32 * 3)  # 32 channels, 96 filters
-        c3 = (32, 32 * 5)  # 32 channels, 160 filters
+        c2 = (32, 32 * 3)
+        c3 = (32, 32 * 5)
         c4 = 32
-        channels = c1 + c2[1] + c3[1] + c4  # 64 + 96 + 160 + 32 = 352
+        channels = c1 + c2[1] + c3[1] + c4
 
         self.inception_block = InceptionBlock(c1, c2, c3, c4)
-
         self.residual_blocks = nn.ModuleList(
             ResidualBlock(channels, channels) for _ in range(num_residual_blocks)
         )
-
         self.se_block = SEBlock(channels, reduction=2) if use_se_block else None
-
         self.global_pool = nn.AdaptiveAvgPool1d(1)
         self.fc = nn.Linear(channels, 32)
         self.output = nn.Linear(32, 1)
 
     def forward(self, x):
-        # x shape: (batch, 1, length)
         x = self.inception_block(x)
-
         for residual_block in self.residual_blocks:
             x = residual_block(x)
-
         if self.se_block is not None:
             x = self.se_block(x)
-
         x = self.global_pool(x)
         x = x.flatten(1)
         x = F.relu(self.fc(x))
@@ -191,8 +155,6 @@ class CNNArchitectureModel(nn.Module):
 
 
 class CNNLightningModule(nn.Module):
-    """Thin wrapper around CNNArchitectureModel (no Lightning)."""
-
     def __init__(
         self,
         learning_rate=1e-3,
@@ -210,7 +172,6 @@ class CNNLightningModule(nn.Module):
             num_residual_blocks=num_residual_blocks,
             use_se_block=use_se_block,
         )
-        self.criterion = nn.MSELoss()
 
     def forward(self, x):
         return self.model(x)
@@ -221,20 +182,10 @@ def _clone_state_dict(model):
 
 
 def _materialize_lazy(model, input_length, device):
-    """Run a dummy forward so LazyConv1d layers get real parameter tensors."""
     model.eval()
     with torch.no_grad():
-        dummy = torch.zeros(1, 1, input_length, device=device)
-        model(dummy)
+        model(torch.zeros(1, 1, input_length, device=device))
     model.train()
-
-
-def _checkpoint_path(model_dir):
-    return os.path.join(model_dir, "best_model_checkpoint.pth")
-
-
-def _legacy_checkpoint_path(model_dir):
-    return os.path.join(model_dir, "best_model_checkpoint.ckpt")
 
 
 def save_checkpoint(path, *, model, optimizer, scheduler, epoch, best_val_loss,
@@ -244,8 +195,8 @@ def save_checkpoint(path, *, model, optimizer, scheduler, epoch, best_val_loss,
     torch.save(
         {
             "model_state_dict": _clone_state_dict(model),
-            "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
-            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
             "epoch": epoch,
             "best_val_loss": best_val_loss,
             "learning_rate": learning_rate,
@@ -275,7 +226,6 @@ def load_model_from_checkpoint(path, device=None):
         module.model.load_state_dict(ckpt["model_state_dict"])
         return module, ckpt
 
-    # Legacy Lightning checkpoint
     hparams = ckpt.get("hyper_parameters", {})
     input_length = hparams.get("input_length", 500)
     module = CNNLightningModule(
@@ -350,14 +300,13 @@ def train_model(X_train, y_train, X_val, y_val, X_test, y_test,
         pin_memory=pin_memory,
     )
 
-    ckpt_path = _checkpoint_path(model_dir)
-    legacy_ckpt = _legacy_checkpoint_path(model_dir)
-    legacy_model = f"{model_dir}/best_model.ckpt"
-    resume_path = None
-    for candidate in (ckpt_path, legacy_ckpt, legacy_model):
-        if os.path.isfile(candidate):
-            resume_path = candidate
-            break
+    ckpt_path = os.path.join(model_dir, "best_model_checkpoint.pth")
+    candidates = (
+        ckpt_path,
+        os.path.join(model_dir, "best_model_checkpoint.ckpt"),
+        f"{model_dir}/best_model.ckpt",
+    )
+    resume_path = next((p for p in candidates if os.path.isfile(p)), None)
 
     resume_ckpt = None
     if resume_path is not None:
@@ -404,19 +353,13 @@ def train_model(X_train, y_train, X_val, y_val, X_test, y_test,
 
     if resume_ckpt is not None and "model_state_dict" in resume_ckpt:
         if resume_ckpt.get("optimizer_state_dict") is not None:
-            try:
-                optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
-            except (ValueError, KeyError) as exc:
-                print(f"Could not restore optimizer state ({exc}); continuing with fresh optimizer.", flush=True)
+            optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
         if resume_ckpt.get("scheduler_state_dict") is not None:
-            try:
-                scheduler.load_state_dict(resume_ckpt["scheduler_state_dict"])
-            except (ValueError, KeyError) as exc:
-                print(f"Could not restore scheduler state ({exc}); continuing with fresh scheduler.", flush=True)
+            scheduler.load_state_dict(resume_ckpt["scheduler_state_dict"])
         for pg in optimizer.param_groups:
             pg['lr'] = learning_rate
-        start_epoch = int(resume_ckpt.get("epoch", 0))
-        best_val_loss = float(resume_ckpt.get("best_val_loss", float('inf')))
+        start_epoch = resume_ckpt.get("epoch", 0)
+        best_val_loss = resume_ckpt.get("best_val_loss", float('inf'))
         if resume_ckpt.get("history"):
             for col, values in resume_ckpt["history"].items():
                 if col in history and values:
@@ -463,28 +406,19 @@ def train_model(X_train, y_train, X_val, y_val, X_test, y_test,
                 history=history,
             )
             torch.save(best_state, best_pth_path)
-            print(f"Saved best model (lowest val_loss) weights to {best_pth_path}", flush=True)
 
     os.makedirs(os.path.dirname(loss_history_path) or ".", exist_ok=True)
-    n = max(len(history['train_loss']), 1)
     pd.DataFrame({
-        'epoch': range(1, n + 1),
-        'train_loss': history['train_loss'] + [None] * (n - len(history['train_loss'])),
-        'val_loss': history['val_loss'] + [None] * (n - len(history['val_loss'])),
-        'train_mae': history['train_mae'] + [None] * (n - len(history['train_mae'])),
-        'val_mae': history['val_mae'] + [None] * (n - len(history['val_mae'])),
+        'epoch': range(1, len(history['train_loss']) + 1),
+        'train_loss': history['train_loss'],
+        'val_loss': history['val_loss'],
+        'train_mae': history['train_mae'],
+        'val_mae': history['val_mae'],
     }).to_csv(loss_history_path, index=False)
     print(f"Saved loss and validation loss to {loss_history_path}", flush=True)
 
-    if best_state is not None:
-        model.model.load_state_dict(best_state)
-    if not os.path.isfile(best_pth_path):
-        torch.save(model.model.state_dict(), best_pth_path)
-        print(
-            f"Saved model weights to {best_pth_path} "
-            f"(no best checkpoint path; using weights at end of training)",
-            flush=True,
-        )
+    model.model.load_state_dict(best_state)
+    torch.save(best_state, best_pth_path)
 
     test_loss, test_mae = _run_epoch(model, test_loader, criterion, device, optimizer=None)
     print(f'test | loss {test_loss:.6f} | mae {test_mae:.6f}', flush=True)

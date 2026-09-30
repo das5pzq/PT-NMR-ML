@@ -5,8 +5,6 @@ Usage (from ml/):
     python test.py --version Test_MLP --data data/20_25_500K.parquet
 """
 
-from __future__ import annotations
-
 import argparse
 import os
 import pickle
@@ -19,7 +17,7 @@ import torch
 from pol_mlp import SimpleFeedForward
 
 
-def _device() -> torch.device:
+def _device():
     if torch.cuda.is_available():
         return torch.device("cuda")
     if torch.backends.mps.is_available():
@@ -27,12 +25,11 @@ def _device() -> torch.device:
     return torch.device("cpu")
 
 
-def _resolve_weight_path(model_dir: str) -> str:
+def _resolve_weight_path(model_dir):
     pth = os.path.join(model_dir, "best_model.pth")
     if os.path.isfile(pth):
         return pth
 
-    # Prefer the newest checkpoint when training is still writing .pth
     candidates = [
         os.path.join(model_dir, name)
         for name in os.listdir(model_dir)
@@ -46,7 +43,7 @@ def _resolve_weight_path(model_dir: str) -> str:
     return max(candidates, key=os.path.getmtime)
 
 
-POLARIZATION_RANGES_PCT: list[tuple[float, float]] = [
+POLARIZATION_RANGES_PCT = [
     (3, 10),
     (10, 15),
     (15, 20),
@@ -60,33 +57,29 @@ POLARIZATION_RANGES_PCT: list[tuple[float, float]] = [
 ]
 
 
-def _in_polarization_range(abs_p: np.ndarray, lo: float, hi: float) -> np.ndarray:
+def _in_polarization_range(abs_p, lo, hi):
     if hi == POLARIZATION_RANGES_PCT[-1][1]:
         return (lo <= abs_p) & (abs_p <= hi)
     return (lo <= abs_p) & (abs_p < hi)
 
 
-def _summarize(values: np.ndarray) -> dict[str, float]:
+def _summarize(values):
     if values.size == 0:
         return {"mean": float("nan"), "median": float("nan"), "std": float("nan")}
     return {
-        "mean": float(np.mean(values)),
-        "median": float(np.median(values)),
-        "std": float(np.std(values)),
+        "mean": np.mean(values).item(),
+        "median": np.median(values).item(),
+        "std": np.std(values).item(),
     }
 
 
-def polarization_range_stats(
-    y_true_pct: np.ndarray,
-    residuals: np.ndarray,
-    rpe: np.ndarray,
-) -> pd.DataFrame:
+def polarization_range_stats(y_true_pct, residuals, rpe):
     abs_p = np.abs(y_true_pct)
-    rows: list[dict[str, float | int | str]] = []
+    rows = []
 
     for lo, hi in POLARIZATION_RANGES_PCT:
         mask = _in_polarization_range(abs_p, lo, hi)
-        n = int(mask.sum())
+        n = mask.sum().item()
         resid_stats = _summarize(residuals[mask])
         rpe_stats = _summarize(rpe[mask])
         rows.append({
@@ -103,7 +96,7 @@ def polarization_range_stats(
     return pd.DataFrame(rows)
 
 
-def print_polarization_range_stats(stats_df: pd.DataFrame) -> None:
+def print_polarization_range_stats(stats_df):
     print("\nTest metrics by polarization range (|actual| %):")
     for _, row in stats_df.iterrows():
         print(f"\n  {row['polarization_range']}  (n={row['n_samples']})")
@@ -119,7 +112,7 @@ def print_polarization_range_stats(stats_df: pd.DataFrame) -> None:
         )
 
 
-def load_model(model_path: str, device: torch.device) -> torch.nn.Module:
+def load_model(model_path, device):
     if model_path.endswith(".ckpt"):
         ckpt = torch.load(model_path, map_location=device, weights_only=False)
         hparams = ckpt["hyper_parameters"]
@@ -162,7 +155,7 @@ def load_model(model_path: str, device: torch.device) -> torch.nn.Module:
     return model
 
 
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser(
         description="Predict polarization with a trained MLP (by version name)."
     )
@@ -209,7 +202,6 @@ def main() -> None:
     print(f"Version: {version}")
     print(f"Data: {args.data}")
 
-    # --- load data (not timed) ---
     df = pd.read_parquet(args.data)
     signal_cols = df.columns[0:512]
     X_raw = df[signal_cols].values.astype("float32")
@@ -221,13 +213,11 @@ def main() -> None:
     n_samples = len(df)
     print(f"Loaded {n_samples} samples")
 
-    # --- load scaler (not timed) ---
     with open(scaler_path, "rb") as f:
         scaler = pickle.load(f)
     X = scaler.transform(X_raw).astype("float32")
     print(f"Loaded scaler from {scaler_path}")
 
-    # --- load / compile model (not timed) ---
     model_path = _resolve_weight_path(model_dir)
     print(f"Loading weights from {model_path}")
     model = load_model(model_path, device)
@@ -238,7 +228,6 @@ def main() -> None:
 
     X_tensor = torch.from_numpy(X).to(device)
 
-    # Warmup so compile / CUDA kernels are not counted in predict time
     with torch.no_grad():
         _ = model(X_tensor[: min(args.batch_size, n_samples)])
     if device.type == "cuda":
@@ -246,7 +235,6 @@ def main() -> None:
     elif device.type == "mps":
         torch.mps.synchronize()
 
-    # --- prediction only (timed) ---
     predictions = []
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -265,7 +253,6 @@ def main() -> None:
         torch.mps.synchronize()
     elapsed = time.perf_counter() - t0
 
-    # Model returns [P, Q] per sample — keep (n, 2), do not flatten.
     y_pred = torch.cat(predictions, dim=0).numpy()
     if y_pred.ndim == 1:
         y_pred = y_pred.reshape(-1, 1)
@@ -276,7 +263,7 @@ def main() -> None:
 
     y_pred_pct = y_pred * 100.0
     pred_names = ("P", "Q")[: y_pred_pct.shape[1]]
-    out: dict[str, np.ndarray] = {
+    out = {
         f"Predicted_{name}": y_pred_pct[:, idx]
         for idx, name in enumerate(pred_names)
     }
@@ -290,9 +277,9 @@ def main() -> None:
             y_h = y_pred_pct[:, idx]
             residuals = y_t - y_h
             rpe = np.abs(y_h - y_t) / np.abs(y_t) * 100.0
-            mse = float(np.mean((y_t - y_h) ** 2))
-            mae = float(np.mean(np.abs(y_t - y_h)))
-            rmse = float(np.sqrt(mse))
+            mse = np.mean((y_t - y_h) ** 2).item()
+            mae = np.mean(np.abs(y_t - y_h)).item()
+            rmse = np.sqrt(mse).item()
             print(f"\nTest metrics ({name} %):")
             print(f"  MSE:      {mse:.6f}")
             print(f"  MAE:      {mae:.6f}")
@@ -303,7 +290,6 @@ def main() -> None:
             out[f"Residuals_{name}"] = residuals
             out[f"RPE_{name}"] = rpe
 
-            # Polarization-range breakdown is only meaningful for P.
             if name == "P":
                 range_stats = polarization_range_stats(y_t, residuals, rpe)
                 print_polarization_range_stats(range_stats)

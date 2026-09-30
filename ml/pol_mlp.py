@@ -46,11 +46,7 @@ class NMRDataset(Dataset):
 
 
 class SimpleFeedForward(nn.Module):
-    def __init__(
-        self,
-        input_dim,
-        hidden_dim=256,
-    ):
+    def __init__(self, input_dim, hidden_dim=256):
         super().__init__()
         self.trunk = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
@@ -70,10 +66,7 @@ class SimpleFeedForward(nn.Module):
         return torch.cat([p, q], dim=-1)
 
 
-# Backwards-compatible name used by older test scripts / docs.
 class FFLightningModule(nn.Module):
-    """Thin wrapper around SimpleFeedForward (no Lightning)."""
-
     def __init__(
         self,
         input_dim=512,
@@ -84,7 +77,6 @@ class FFLightningModule(nn.Module):
     ):
         super().__init__()
         self.model = SimpleFeedForward(input_dim, hidden_dim)
-        self.criterion = nn.L1Loss()
         self.learning_rate = learning_rate
         self.max_epochs = max_epochs
         self.weight_decay = weight_decay
@@ -105,14 +97,6 @@ def _clone_state_dict(model):
     return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
 
-def _checkpoint_path(model_dir):
-    return os.path.join(model_dir, "best_model_checkpoint.pth")
-
-
-def _legacy_checkpoint_path(model_dir):
-    return os.path.join(model_dir, "best_model_checkpoint.ckpt")
-
-
 def save_checkpoint(path, *, model, optimizer, scheduler, epoch, best_val_mae,
                     input_dim, hidden_dim, learning_rate, max_epochs, weight_decay,
                     history):
@@ -120,8 +104,8 @@ def save_checkpoint(path, *, model, optimizer, scheduler, epoch, best_val_mae,
     torch.save(
         {
             "model_state_dict": _clone_state_dict(model),
-            "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
-            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
             "epoch": epoch,
             "best_val_mae": best_val_mae,
             "input_dim": input_dim,
@@ -136,17 +120,14 @@ def save_checkpoint(path, *, model, optimizer, scheduler, epoch, best_val_mae,
 
 
 def load_model_from_checkpoint(path, device=None):
-    """Load FFLightningModule / SimpleFeedForward from a .pth or legacy Lightning .ckpt."""
     if device is None:
         device = DEVICE
     ckpt = torch.load(path, map_location=device, weights_only=False)
 
     if "model_state_dict" in ckpt:
-        input_dim = ckpt.get("input_dim", 512)
-        hidden_dim = ckpt.get("hidden_dim", 256)
         module = FFLightningModule(
-            input_dim=input_dim,
-            hidden_dim=hidden_dim,
+            input_dim=ckpt.get("input_dim", 512),
+            hidden_dim=ckpt.get("hidden_dim", 256),
             learning_rate=ckpt.get("learning_rate", 1e-3),
             max_epochs=ckpt.get("max_epochs", 500),
             weight_decay=ckpt.get("weight_decay", 1e-5),
@@ -155,7 +136,6 @@ def load_model_from_checkpoint(path, device=None):
         module.to(device)
         return module, ckpt
 
-    # Legacy Lightning checkpoint
     hparams = ckpt.get("hyper_parameters", {})
     module = FFLightningModule(
         input_dim=hparams.get("input_dim", 512),
@@ -186,13 +166,11 @@ def _load_or_create_model(
     if device is None:
         device = DEVICE
 
-    ckpt_path = _checkpoint_path(model_dir)
-    legacy_path = _legacy_checkpoint_path(model_dir)
-    resume_path = None
-    if os.path.isfile(ckpt_path):
-        resume_path = ckpt_path
-    elif os.path.isfile(legacy_path):
-        resume_path = legacy_path
+    ckpt_path = os.path.join(model_dir, "best_model_checkpoint.pth")
+    legacy_path = os.path.join(model_dir, "best_model_checkpoint.ckpt")
+    resume_path = ckpt_path if os.path.isfile(ckpt_path) else (
+        legacy_path if os.path.isfile(legacy_path) else None
+    )
 
     if resume_path is None:
         print("No existing model found. Building new model...", flush=True)
@@ -203,23 +181,21 @@ def _load_or_create_model(
             max_epochs=max_epochs,
             weight_decay=weight_decay,
         ).to(device)
-        return model, None, None
+        return model, None
 
     print(f"Resuming from {resume_path}", flush=True)
     model, ckpt = load_model_from_checkpoint(resume_path, device=device)
     model.learning_rate = learning_rate
     model.max_epochs = max_epochs
     model.weight_decay = weight_decay
-    return model, resume_path, ckpt
+    return model, ckpt
 
 
 def _load_prior_loss_history(save_path):
     if not os.path.isfile(save_path):
         return None
     history = pd.read_csv(save_path)
-    if history.empty:
-        return None
-    return history
+    return None if history.empty else history
 
 
 def _run_epoch(model, loader, criterion, device, optimizer=None):
@@ -277,7 +253,7 @@ def train_model(X_train, y_train, X_val, y_val, X_test, y_test,
     loss_history_path = f"{performance_dir}/{version}_loss.csv"
     prior_loss_history = _load_prior_loss_history(loss_history_path)
 
-    model, resume_path, resume_ckpt = _load_or_create_model(
+    model, resume_ckpt = _load_or_create_model(
         model_dir,
         input_dim,
         hidden_dim,
@@ -317,25 +293,19 @@ def train_model(X_train, y_train, X_val, y_val, X_test, y_test,
 
     if resume_ckpt is not None and "model_state_dict" in resume_ckpt:
         if resume_ckpt.get("optimizer_state_dict") is not None:
-            try:
-                optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
-            except (ValueError, KeyError) as exc:
-                print(f"Could not restore optimizer state ({exc}); continuing with fresh optimizer.", flush=True)
+            optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
         if resume_ckpt.get("scheduler_state_dict") is not None:
-            try:
-                scheduler.load_state_dict(resume_ckpt["scheduler_state_dict"])
-            except (ValueError, KeyError) as exc:
-                print(f"Could not restore scheduler state ({exc}); continuing with fresh scheduler.", flush=True)
+            scheduler.load_state_dict(resume_ckpt["scheduler_state_dict"])
         for pg in optimizer.param_groups:
             pg['lr'] = learning_rate
-        start_epoch = int(resume_ckpt.get("epoch", 0))
-        best_val_mae = float(resume_ckpt.get("best_val_mae", float('inf')))
+        start_epoch = resume_ckpt.get("epoch", 0)
+        best_val_mae = resume_ckpt.get("best_val_mae", float('inf'))
         if resume_ckpt.get("history"):
             for col, values in resume_ckpt["history"].items():
                 if col in history and values:
                     history[col] = list(values)
 
-    ckpt_path = _checkpoint_path(model_dir)
+    ckpt_path = os.path.join(model_dir, "best_model_checkpoint.pth")
     best_pth_path = f"{model_dir}/best_model.pth"
 
     for epoch in range(start_epoch, max_epochs):
@@ -378,20 +348,17 @@ def train_model(X_train, y_train, X_val, y_val, X_test, y_test,
             )
             torch.save(best_state, best_pth_path)
 
-    n = max(len(history['train_loss']), 1)
     pd.DataFrame({
-        'epoch': range(1, n + 1),
-        'train_loss': history['train_loss'] + [None] * (n - len(history['train_loss'])),
-        'val_loss': history['val_loss'] + [None] * (n - len(history['val_loss'])),
-        'train_mae': history['train_mae'] + [None] * (n - len(history['train_mae'])),
-        'val_mae': history['val_mae'] + [None] * (n - len(history['val_mae'])),
+        'epoch': range(1, len(history['train_loss']) + 1),
+        'train_loss': history['train_loss'],
+        'val_loss': history['val_loss'],
+        'train_mae': history['train_mae'],
+        'val_mae': history['val_mae'],
     }).to_csv(loss_history_path, index=False)
     print(f"Saved loss history to {loss_history_path}", flush=True)
 
-    if best_state is not None:
-        model.model.load_state_dict(best_state)
-    if not os.path.isfile(best_pth_path):
-        torch.save(model.model.state_dict(), best_pth_path)
+    model.model.load_state_dict(best_state)
+    torch.save(best_state, best_pth_path)
 
     test_loss, test_mae = _run_epoch(model, test_loader, criterion, device, optimizer=None)
     print(f'test | loss {test_loss:.6f} | mae {test_mae:.6f}', flush=True)

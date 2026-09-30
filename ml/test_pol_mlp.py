@@ -1,5 +1,5 @@
 """
-Does prediction on selected RGC dataset. 
+Does prediction on selected RGC dataset.
 """
 
 import argparse
@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from pol_mlp import FFLightningModule, load_model_from_checkpoint
+from pol_mlp import load_model_from_checkpoint
 
 ML_DIR = Path(__file__).resolve().parent
 REPO_ROOT = ML_DIR.parent
@@ -26,12 +26,12 @@ SIGNAL_KEY = "phase"
 N_BINS = 512
 
 
-def load_records(path: Path) -> list[dict]:
+def load_records(path):
     with path.open("r", encoding="utf-8") as f:
         return [json.loads(line) for line in f if line.strip()]
 
 
-def load_model(checkpoint_path: Path, device: torch.device) -> FFLightningModule:
+def load_model(checkpoint_path, device):
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     model, _ = load_model_from_checkpoint(str(checkpoint_path), device=device)
@@ -39,19 +39,14 @@ def load_model(checkpoint_path: Path, device: torch.device) -> FFLightningModule
     return model
 
 
-def load_scaler(scaler_path: Path):
+def load_scaler(scaler_path):
     if not scaler_path.is_file():
         raise FileNotFoundError(f"Scaler not found: {scaler_path}")
     with scaler_path.open("rb") as f:
         return pickle.load(f)
 
 
-def records_to_features(
-    records: list[dict],
-    scaler,
-    signal_key: str = SIGNAL_KEY,
-    n_bins: int = N_BINS,
-) -> tuple[np.ndarray, np.ndarray, list[dict]]:
+def records_to_features(records, scaler, signal_key=SIGNAL_KEY, n_bins=N_BINS):
     spectra = []
     exp_p = []
     meta = []
@@ -66,7 +61,7 @@ def records_to_features(
                 f"Event {idx} has {signal.shape[0]} bins; expected {n_bins}"
             )
         spectra.append(signal)
-        exp_p.append(float(record["pol"]))
+        exp_p.append(record["pol"])
         meta.append(
             {
                 "event_index": idx,
@@ -84,7 +79,7 @@ def records_to_features(
 
 
 @torch.no_grad()
-def predict(model: FFLightningModule, X: np.ndarray, batch_size: int, device: torch.device) -> np.ndarray:
+def predict(model, X, batch_size, device):
     preds = []
     for start in range(0, len(X), batch_size):
         batch = torch.from_numpy(X[start : start + batch_size]).to(device)
@@ -92,34 +87,27 @@ def predict(model: FFLightningModule, X: np.ndarray, batch_size: int, device: to
     return np.concatenate(preds, axis=0).reshape(-1)
 
 
-def compute_summary(exp_frac: np.ndarray, pred_frac: np.ndarray) -> dict:
+def compute_summary(exp_frac, pred_frac):
     exp_pct = exp_frac * 100.0
     pred_pct = pred_frac * 100.0
     residuals = exp_pct - pred_pct
 
     return {
-        "n_events": int(len(residuals)),
+        "n_events": len(residuals),
         "residual_stats_pct": {
-            "mean": float(np.mean(residuals)),
-            "std": float(np.std(residuals)),
-            "median": float(np.median(residuals)),
-            "min": float(np.min(residuals)),
-            "max": float(np.max(residuals)),
-            "mean_abs": float(np.mean(np.abs(residuals))),
-            "rmse": float(np.sqrt(np.mean(residuals ** 2))),
-            "max_abs": float(np.max(np.abs(residuals))),
+            "mean": np.mean(residuals).item(),
+            "std": np.std(residuals).item(),
+            "median": np.median(residuals).item(),
+            "min": np.min(residuals).item(),
+            "max": np.max(residuals).item(),
+            "mean_abs": np.mean(np.abs(residuals)).item(),
+            "rmse": np.sqrt(np.mean(residuals ** 2)).item(),
+            "max_abs": np.max(np.abs(residuals)).item(),
         },
     }
 
 
-def save_results(
-    output_dir: Path,
-    stem: str,
-    meta: list[dict],
-    exp_frac: np.ndarray,
-    pred_frac: np.ndarray,
-    summary: dict,
-) -> None:
+def save_results(output_dir, stem, meta, exp_frac, pred_frac, summary):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     exp_pct = exp_frac * 100.0
@@ -148,7 +136,7 @@ def save_results(
     print(f"Saved summary to {summary_path}")
 
 
-def print_summary(summary: dict) -> None:
+def print_summary(summary):
     stats = summary["residual_stats_pct"]
     print("\n" + "=" * 60)
     print(f"Data-test inference ({summary['n_events']} events)")
@@ -164,7 +152,7 @@ def print_summary(summary: dict) -> None:
     print(f"  Max |residual|:      {stats['max_abs']:.6f}")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--data-path",
@@ -205,7 +193,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def resolve_device(device_arg: str) -> torch.device:
+def resolve_device(device_arg):
     if device_arg == "auto":
         if torch.cuda.is_available():
             return torch.device("cuda")
@@ -215,7 +203,7 @@ def resolve_device(device_arg: str) -> torch.device:
     return torch.device(device_arg)
 
 
-def main() -> None:
+def main():
     args = parse_args()
     version = args.version
     performance_dir = ML_DIR / "Model_Performance" / version

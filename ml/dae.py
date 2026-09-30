@@ -1,5 +1,3 @@
-from typing import Tuple
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -37,12 +35,7 @@ DEVICE = _device()
 
 
 class DenoisingAutoencoder(nn.Module):
-    """
-    Simple DAE: input_dim -> bottleneck -> input_dim.
-    Input: noisy signal (normalized); output: clean signal (normalized).
-    """
-
-    def __init__(self, input_dim: int = 500, hidden_dims: Tuple[int, ...] = (256, 128, 64, 32, 16)):
+    def __init__(self, input_dim=500, hidden_dims=(256, 128, 64, 32, 16)):
         super().__init__()
         self.input_dim = input_dim
 
@@ -73,7 +66,7 @@ class DenoisingAutoencoder(nn.Module):
         layers.append(nn.Linear(prev, input_dim))
         self.decoder = nn.Sequential(*layers)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         z = self.encoder(x)
         return self.decoder(z)
 
@@ -83,11 +76,10 @@ class AE(nn.Module):
         self,
         noise_factor=DEFAULT_NOISE_FACTOR,
         scaler=None,
-        input_dim: int = 500,
-        hidden_dims: Tuple[int, ...] = (256, 128, 64, 32, 16),
+        input_dim=500,
+        hidden_dims=(256, 128, 64, 32, 16),
     ):
         super(AE, self).__init__()
-        # Gaussian noise std in raw spectrum units (same units as parquet columns before scaling).
         self.noise_factor = noise_factor
         self.scaler = scaler
         self.input_dim = input_dim
@@ -95,12 +87,10 @@ class AE(nn.Module):
         self.net = DenoisingAutoencoder(input_dim=input_dim, hidden_dims=hidden_dims)
 
     def add_noise(self, x):
-        """Additive Gaussian noise; std = ``noise_factor`` in the same units as ``x``."""
         noise = torch.randn_like(x) * self.noise_factor
         return x + noise
 
-    def noisy_scaled_batch(self, x_clean_scaled: torch.Tensor) -> torch.Tensor:
-        """Inverse-scale clean inputs, add noise in raw units, then scale (training/eval pipeline)."""
+    def noisy_scaled_batch(self, x_clean_scaled):
         x_phys = self.unscale_with_scaler(x_clean_scaled)
         x_noisy_phys = self.add_noise(x_phys)
         return self.scale_with_scaler(x_noisy_phys)
@@ -232,14 +222,15 @@ if __name__ == '__main__':
 
     train_dataset, val_dataset, test_dataset = data.random_split(dataset, [0.80, 0.10, 0.10])
 
-    num_workers = min(13, os.cpu_count() or 0)
-    loader_kwargs = {"batch_size": BATCH_SIZE}
-    if num_workers > 0:
-        loader_kwargs.update({"num_workers": num_workers, "persistent_workers": True})
-
-    train_loader = data.DataLoader(train_dataset, shuffle=True, **loader_kwargs)
-    val_loader = data.DataLoader(val_dataset, shuffle=False, **loader_kwargs)
-    test_loader = data.DataLoader(test_dataset, shuffle=False, **loader_kwargs)
+    train_loader = data.DataLoader(
+        train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=13, persistent_workers=True
+    )
+    val_loader = data.DataLoader(
+        val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=13, persistent_workers=True
+    )
+    test_loader = data.DataLoader(
+        test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=13, persistent_workers=True
+    )
 
     model = AE(noise_factor=DEFAULT_NOISE_FACTOR, scaler=X_Scaler).to(device)
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -344,7 +335,6 @@ if __name__ == '__main__':
             x_clean_scaled = x.clone().view(x.size(0), -1)
 
             x_noisy_scaled = model.noisy_scaled_batch(x_clean_scaled)
-
             decoded_scaled = model.forward(x_noisy_scaled)
 
             x_clean_unscaled = model.unscale_with_scaler(x_clean_scaled)
@@ -381,7 +371,6 @@ if __name__ == '__main__':
     noise_mag_phys = np.mean(np.abs(test_X_noisy_unscaled - test_X_actual_unscaled))
     print(f"\nNoise verification (physical units): mean |noisy - clean| = {noise_mag_phys:.6f}", flush=True)
     print(f"Noise std (raw spectrum units, before scaling): {model.noise_factor}", flush=True)
-    # example plot with noisy input shown
     plt.figure(figsize=(16, 12))
     plt.style.use('ggplot')
     plt.plot(test_X_actual_unscaled[0], label='Actual (Clean)', color='red', linewidth=2)
