@@ -162,6 +162,47 @@ class RGCSignalGenerator:
         columns = self._build_columns(signals, p_values, q_values, cc_values, snrs, areas, meta_rows)
         return self._persist(columns, job_id)
 
+    def generate_from_params(
+        self,
+        param_rows: Sequence[dict[str, float]],
+        job_id: Optional[str] = None,
+    ) -> str:
+        """Write spectra for an explicit parameter list. Does not call sample_rgc_params."""
+        n_samples = len(param_rows)
+        if n_samples == 0:
+            raise ValueError("param_rows is empty")
+        self.logger.info("Generating %d RGC deuteron samples from provided parameters", n_samples)
+
+        signals: List[np.ndarray] = []
+        p_values: List[float] = []
+        q_values: List[float] = []
+        cc_values: List[float] = []
+        areas: List[float] = []
+        snrs: List[Optional[float]] = []
+        meta_rows: List[dict[str, float]] = []
+
+        for i, params in enumerate(tqdm.tqdm(param_rows, desc="Generating RGC samples")):
+            sample = self.generate_one(params)
+            used = sample["params"]
+            signals.append(sample["signal"])
+            p_values.append(float(used["P"]))
+            q_values.append(float(used["Q"]))
+            cc_values.append(float(used["cc"]))
+            areas.append(sample["area"])
+            snrs.append(sample["snr"])
+            meta_rows.append(
+                {
+                    key: used[key]
+                    for key in (*DULYA_SAMPLE_KEYS, *BASELINE_SAMPLE_KEYS)
+                    if key not in ("P", "cc")
+                }
+            )
+            if (i + 1) % 10000 == 0:
+                self.logger.info("Generated %d/%d samples", i + 1, n_samples)
+
+        columns = self._build_columns(signals, p_values, q_values, cc_values, snrs, areas, meta_rows)
+        return self._persist(columns, job_id)
+
     def _build_columns(
         self,
         signals: Sequence[np.ndarray],

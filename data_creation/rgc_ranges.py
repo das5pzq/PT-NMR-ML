@@ -1,6 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, NamedTuple, Optional, Tuple
 
 import numpy as np
 import yaml
@@ -8,8 +8,14 @@ import yaml
 _DATA_DIR = Path(__file__).resolve().parent
 DULYA_FITS_YAML = _DATA_DIR / "fitting" / "dulya_fits_single_period.yaml"
 BASELINE_FITS_YAML = _DATA_DIR / "fitting" / "baseline_fits_single_event.yaml"
+DULYA_HIGHEST_FITS_YAML = _DATA_DIR / "fitting" / "dulya_fits_highest.yaml"
+BASELINE_DATA_D_FITS_YAML = _DATA_DIR / "fitting" / "baseline_fits_data_d.yaml"
 DULYA_STATS_YAML = _DATA_DIR / "fitting" / "dulya_fit_stats_single_period.yaml"
 BASELINE_STATS_YAML = _DATA_DIR / "fitting" / "baseline_fit_stats_single_event.yaml"
+
+P_ABS_MIN = 0.10
+P_ABS_MAX = 0.60
+CKNOB_REL_HALF_WIDTH = 1e-2
 
 RGC_FREQ_MIN_MHZ = 32.3
 RGC_FREQ_MAX_MHZ = 33.1
@@ -202,6 +208,80 @@ def sample_rgc_params(
 
     params["Q"] = 2 - np.sqrt(4 - 3*params["P"]**2)
 
+    return params
+
+
+class SyncedPeriod(NamedTuple):
+    """One data-file period: every Dulya event paired with that file's baseline fit."""
+
+    index: int
+    filename: str
+    templates: tuple[dict[str, float], ...]
+
+
+def _fit_files(path: Path) -> dict[str, dict]:
+    if not path.is_file():
+        return {}
+    with path.open("r", encoding="utf-8") as handle:
+        payload = yaml.safe_load(handle) or {}
+    return {name: block for name, block in payload.items() if isinstance(block, dict)}
+
+
+def _signed_p_window(fitted_p: float) -> tuple[float, float]:
+    if fitted_p >= 0.0:
+        return (P_ABS_MIN, P_ABS_MAX)
+    return (-P_ABS_MAX, -P_ABS_MIN)
+
+
+@lru_cache(maxsize=1)
+def load_synced_periods() -> tuple[SyncedPeriod, ...]:
+    """Periods present in both highest-Dulya and data-d baseline fits, filename-sorted.
+
+    Index is 1-based so it matches a SLURM array task id.
+    """
+    dulya_files = _fit_files(DULYA_HIGHEST_FITS_YAML)
+    baseline_files = _fit_files(BASELINE_DATA_D_FITS_YAML)
+    shared = sorted(set(dulya_files) & set(baseline_files))
+    periods: list[SyncedPeriod] = []
+    for index, filename in enumerate(shared, start=1):
+        dulya_events = dulya_files[filename].get("events") or {}
+        baseline_events = baseline_files[filename].get("events") or {}
+        if not dulya_events:
+            raise ValueError(f"{filename} has no Dulya events in {DULYA_HIGHEST_FITS_YAML.name}")
+        if len(baseline_events) != 1:
+            raise ValueError(
+                f"{filename} has {len(baseline_events)} baseline events in "
+                f"{BASELINE_DATA_D_FITS_YAML.name}; expected 1"
+            )
+        baseline_params = _baseline_event_to_params(next(iter(baseline_events.values())))
+        templates: list[dict[str, float]] = []
+        for event in dulya_events.values():
+            merged = _dulya_event_to_params(event)
+            merged.update(baseline_params)
+            templates.append(merged)
+        periods.append(SyncedPeriod(index=index, filename=filename, templates=tuple(templates)))
+    return tuple(periods)
+
+
+def sample_synced_period_params(
+    period: SyncedPeriod,
+    rng: np.random.Generator | None = None,
+) -> dict[str, float]:
+    """Copy one period template, then vary only P (signed 10–60%) and Cknob (±|C|/100)."""
+    if rng is None:
+        rng = np.random.default_rng()
+    if not period.templates:
+        raise ValueError(f"Period {period.index} ({period.filename}) has no Dulya templates")
+
+    template = period.templates[int(rng.integers(len(period.templates)))]
+    params = dict(template)
+    fitted_p = float(params["P"])
+    fitted_cknob = float(params["Cknob"])
+    p_lo, p_hi = _signed_p_window(fitted_p)
+    params["P"] = float(rng.uniform(p_lo, p_hi))
+    delta = abs(fitted_cknob) * CKNOB_REL_HALF_WIDTH
+    params["Cknob"] = float(rng.uniform(fitted_cknob - delta, fitted_cknob + delta))
+    params["Q"] = float(2.0 - np.sqrt(4.0 - 3.0 * params["P"] ** 2))
     return params
 
 
