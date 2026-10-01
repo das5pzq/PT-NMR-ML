@@ -24,8 +24,8 @@ device = torch.device('cuda')
 
 
 if __name__ == "__main__":
-    data_path = "data/Training_Data_RGC_17_34_500K.parquet"
-    version = 'Training_Data_RGC_17_34_500K_V3'
+    data_path = "data/Training_Data_RGC_Period_Test.parquet"
+    version = 'Training_Data_RGC_Period_Test'
     performance_dir = f"Model_Performance/{version}"
     model_dir = f"Models/{version}"
     os.makedirs(performance_dir, exist_ok=True)
@@ -76,7 +76,7 @@ if __name__ == "__main__":
 
     learning_rate = 3e-4
     max_epochs   = 500
-    hidden_dim   = 512
+    hidden_dim   = 256
     batch_size   = 256
     weight_decay = 1e-5
 

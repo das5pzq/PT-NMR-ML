@@ -22,8 +22,8 @@ torch.cuda.manual_seed_all(42)
 
 
 if __name__ == "__main__":
-    data_path = "data/Training_Data_RGC_3_55_500K.parquet"
-    version = 'CNN_RGC_3_55_V1'
+    data_path = "data/Training_Data_RGC_Period_Test.parquet"
+    version = 'CNN_RGC_Period_Test'
     performance_dir = f"Model_Performance/{version}"
     model_dir = f"Models/{version}"
     os.makedirs(performance_dir, exist_ok=True)

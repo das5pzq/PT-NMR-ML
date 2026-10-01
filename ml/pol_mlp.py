@@ -272,8 +272,13 @@ def train_model(X_train, y_train, X_val, y_val, X_test, y_test,
         lr=learning_rate,
         weight_decay=weight_decay,
     )
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max_epochs, eta_min=1e-7
+    # First cycle decays within ~20 epochs, then restarts with longer cycles.
+    # A single cosine over max_epochs leaves the rate unchanged while val_mae stalls.
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=20,
+        T_mult=2,
+        eta_min=1e-6,
     )
 
     history = {
@@ -294,10 +299,17 @@ def train_model(X_train, y_train, X_val, y_val, X_test, y_test,
     if resume_ckpt is not None and "model_state_dict" in resume_ckpt:
         if resume_ckpt.get("optimizer_state_dict") is not None:
             optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
-        if resume_ckpt.get("scheduler_state_dict") is not None:
-            scheduler.load_state_dict(resume_ckpt["scheduler_state_dict"])
-        for pg in optimizer.param_groups:
-            pg['lr'] = learning_rate
+        sched_state = resume_ckpt.get("scheduler_state_dict")
+        if sched_state is not None and "T_0" in sched_state:
+            scheduler.load_state_dict(sched_state)
+        else:
+            for pg in optimizer.param_groups:
+                pg['lr'] = learning_rate
+            if sched_state is not None:
+                print(
+                    "Checkpoint scheduler is not cosine warm restarts; starting a new schedule.",
+                    flush=True,
+                )
         start_epoch = resume_ckpt.get("epoch", 0)
         best_val_mae = resume_ckpt.get("best_val_mae", float('inf'))
         if resume_ckpt.get("history"):
