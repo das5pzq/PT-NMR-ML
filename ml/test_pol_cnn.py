@@ -1,0 +1,263 @@
+"""
+Load the train_cnn_v2 polarization CNN and run it on a data-test file.
+
+Each spectrum is centered and scaled on its own, matching training. The model
+returns vector polarization P and tensor polarization Q. Experimental files
+label P only (`pol`); Q is written out but not scored.
+
+Usage (from ml/):
+    python test_pol_cnn.py
+    python test_pol_cnn.py --version Training_Data_RGC_Period_Test_CNN --data-path ../data_creation/data-test/your_file.txt
+"""
+
+import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+
+from train_cnn_v2 import PolarizationCNN, standardize_traces
+
+ML_DIR = Path(__file__).resolve().parent
+REPO_ROOT = ML_DIR.parent
+DEFAULT_VERSION = "Training_Data_RGC_Period_Test_CNN"
+DEFAULT_DATA = (
+    REPO_ROOT
+    / "data_creation"
+    / "data-test"
+    / "2022-09-23_00-54-02__2022-09-23_14-13-02.txt"
+)
+SIGNAL_KEY = "phase"
+N_BINS = 512
+
+
+def load_records(path):
+    with path.open("r", encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def load_model(checkpoint_path, device):
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+        state = ckpt["model_state_dict"]
+    else:
+        state = ckpt
+    model = PolarizationCNN().to(device)
+    model.load_state_dict(state)
+    model.eval()
+    return model
+
+
+def records_to_features(records, signal_key=SIGNAL_KEY, n_bins=N_BINS):
+    spectra = []
+    exp_p = []
+    meta = []
+
+    for idx, record in enumerate(records):
+        signal = record.get(signal_key)
+        if signal is None:
+            raise KeyError(f"Event {idx} missing '{signal_key}'")
+        signal = np.asarray(signal, dtype=np.float32)
+        if signal.shape[0] != n_bins:
+            raise ValueError(
+                f"Event {idx} has {signal.shape[0]} bins; expected {n_bins}"
+            )
+        spectra.append(signal)
+        exp_p.append(record["pol"])
+        meta.append(
+            {
+                "event_index": idx,
+                "num": record.get("num"),
+                "start_time": record.get("start_time"),
+                "stop_time": record.get("stop_time"),
+                "cc": record.get("cc"),
+                "area": record.get("area"),
+            }
+        )
+
+    X = standardize_traces(np.stack(spectra, axis=0))
+    y_exp = np.asarray(exp_p, dtype=np.float32)
+    return X, y_exp, meta
+
+
+@torch.no_grad()
+def predict(model, X, batch_size, device):
+    preds = []
+    for start in range(0, len(X), batch_size):
+        batch = torch.from_numpy(X[start : start + batch_size]).to(device)
+        preds.append(model(batch).cpu().numpy())
+    return np.concatenate(preds, axis=0)
+
+
+def _residual_stats(exp_frac, pred_frac):
+    exp_pct = exp_frac * 100.0
+    pred_pct = pred_frac * 100.0
+    residuals = exp_pct - pred_pct
+    return {
+        "mean": np.mean(residuals).item(),
+        "std": np.std(residuals).item(),
+        "median": np.median(residuals).item(),
+        "min": np.min(residuals).item(),
+        "max": np.max(residuals).item(),
+        "mean_abs": np.mean(np.abs(residuals)).item(),
+        "rmse": np.sqrt(np.mean(residuals ** 2)).item(),
+        "max_abs": np.max(np.abs(residuals)).item(),
+    }
+
+
+def compute_summary(exp_p_frac, pred_pq_frac):
+    pred_p = pred_pq_frac[:, 0]
+    pred_q = pred_pq_frac[:, 1]
+    pred_q_pct = pred_q * 100.0
+    return {
+        "n_events": len(exp_p_frac),
+        "residual_stats_P_pct": _residual_stats(exp_p_frac, pred_p),
+        "predicted_Q_pct": {
+            "mean": np.mean(pred_q_pct).item(),
+            "std": np.std(pred_q_pct).item(),
+            "median": np.median(pred_q_pct).item(),
+            "min": np.min(pred_q_pct).item(),
+            "max": np.max(pred_q_pct).item(),
+        },
+    }
+
+
+def save_results(output_dir, stem, meta, exp_p_frac, pred_pq_frac, summary):
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    exp_p_pct = exp_p_frac * 100.0
+    pred_p_pct = pred_pq_frac[:, 0] * 100.0
+    pred_q_pct = pred_pq_frac[:, 1] * 100.0
+    residuals_p = exp_p_pct - pred_p_pct
+
+    rows = []
+    for i, event_meta in enumerate(meta):
+        rows.append(
+            {
+                **event_meta,
+                "exp_p": exp_p_pct[i],
+                "Predicted_P_pct": pred_p_pct[i],
+                "Residual_P_pct": residuals_p[i],
+                "Predicted_Q_pct": pred_q_pct[i],
+            }
+        )
+
+    results_csv = output_dir / f"{stem}_cnn_results.csv"
+    pd.DataFrame(rows).to_csv(results_csv, index=False)
+
+    summary_path = output_dir / f"{stem}_cnn_summary.json"
+    with summary_path.open("w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=4)
+
+    print(f"Saved per-event results to {results_csv}")
+    print(f"Saved summary to {summary_path}")
+
+
+def print_summary(summary):
+    stats = summary["residual_stats_P_pct"]
+    q_stats = summary["predicted_Q_pct"]
+    print("\n" + "=" * 60)
+    print(f"Data-test inference ({summary['n_events']} events)")
+    print("P residuals = exp_p - Predicted_P_pct  (pct points)")
+    print("=" * 60)
+    print(f"  Mean:                {stats['mean']:.6f}")
+    print(f"  Std:                 {stats['std']:.6f}")
+    print(f"  Median:              {stats['median']:.6f}")
+    print(f"  Min:                 {stats['min']:.6f}")
+    print(f"  Max:                 {stats['max']:.6f}")
+    print(f"  Mean |residual|:     {stats['mean_abs']:.6f}")
+    print(f"  RMSE:                {stats['rmse']:.6f}")
+    print(f"  Max |residual|:      {stats['max_abs']:.6f}")
+    print("Predicted Q (pct); no experimental Q label on this file")
+    print(f"  Mean:                {q_stats['mean']:.6f}")
+    print(f"  Std:                 {q_stats['std']:.6f}")
+    print(f"  Median:              {q_stats['median']:.6f}")
+    print(f"  Min:                 {q_stats['min']:.6f}")
+    print(f"  Max:                 {q_stats['max']:.6f}")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--data-path",
+        type=Path,
+        default=DEFAULT_DATA,
+        help="JSONL data-test file with 'phase' and 'pol' fields",
+    )
+    parser.add_argument(
+        "--version",
+        default=DEFAULT_VERSION,
+        help="Model/version subdirectory under Models/ and Model_Performance/",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=None,
+        help="Optional explicit checkpoint path",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Directory for CSV/JSON outputs",
+    )
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument(
+        "--device",
+        default="auto",
+        choices=("auto", "cpu", "cuda", "mps"),
+        help="Inference device",
+    )
+    return parser.parse_args()
+
+
+def resolve_device(device_arg):
+    if device_arg == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    return torch.device(device_arg)
+
+
+def main():
+    args = parse_args()
+    version = args.version
+    performance_dir = ML_DIR / "Model_Performance" / version
+    model_dir = ML_DIR / "Models" / version
+
+    if args.checkpoint is not None:
+        checkpoint_path = args.checkpoint
+    else:
+        candidates = (
+            model_dir / "best_model.pth",
+            model_dir / "best_model_checkpoint.pth",
+            model_dir / "best_model_checkpoint.ckpt",
+        )
+        checkpoint_path = next((p for p in candidates if p.is_file()), candidates[0])
+    output_dir = args.output_dir or (performance_dir / "data_test")
+    stem = args.data_path.stem
+
+    device = resolve_device(args.device)
+    print(f"Loading model from {checkpoint_path}")
+    print(f"Loading events from {args.data_path}")
+    print(f"Using device: {device}")
+
+    model = load_model(checkpoint_path, device)
+    records = load_records(args.data_path)
+
+    X, y_exp, meta = records_to_features(records, signal_key=SIGNAL_KEY)
+    y_pred = predict(model, X, batch_size=args.batch_size, device=device)
+    summary = compute_summary(y_exp, y_pred)
+
+    print_summary(summary)
+    save_results(output_dir, stem, meta, y_exp, y_pred, summary)
+
+
+if __name__ == "__main__":
+    main()
