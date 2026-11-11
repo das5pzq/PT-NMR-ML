@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from pol_mlp import SimpleFeedForward
+from pol_mlp import SimpleFeedForward, load_model_from_checkpoint
 
 
 def _device():
@@ -128,6 +128,11 @@ def load_model(model_path, device):
         model.load_state_dict(state)
     else:
         payload = torch.load(model_path, map_location=device, weights_only=False)
+        state = payload.get("model_state_dict") if isinstance(payload, dict) else None
+        if isinstance(state, dict) and "stem.0.weight" in state and "head_p.weight" in state:
+            model, _ = load_model_from_checkpoint(model_path, device=device)
+            model.eval()
+            return model
         if isinstance(payload, dict) and "model_state_dict" in payload:
             state = payload["model_state_dict"]
             input_dim = payload.get("input_dim")

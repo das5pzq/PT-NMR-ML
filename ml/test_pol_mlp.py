@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from pol_mlp import load_model_from_checkpoint
+from pol_mlp import DEFAULT_CHECKPOINT, load_model_from_checkpoint
 
 ML_DIR = Path(__file__).resolve().parent
 REPO_ROOT = ML_DIR.parent
@@ -168,8 +168,8 @@ def parse_args():
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=None,
-        help="Optional explicit checkpoint path",
+        default=Path(DEFAULT_CHECKPOINT),
+        help="Checkpoint path (default: ml/pol_mlp.pth)",
     )
     parser.add_argument(
         "--scaler-path",
@@ -207,17 +207,7 @@ def main():
     args = parse_args()
     version = args.version
     performance_dir = ML_DIR / "Model_Performance" / version
-    model_dir = ML_DIR / "Models" / version
-
-    if args.checkpoint is not None:
-        checkpoint_path = args.checkpoint
-    else:
-        candidates = (
-            model_dir / "best_model_checkpoint.pth",
-            model_dir / "best_model_checkpoint.ckpt",
-            model_dir / "best_model.pth",
-        )
-        checkpoint_path = next((p for p in candidates if p.is_file()), candidates[0])
+    checkpoint_path = args.checkpoint
     scaler_path = args.scaler_path or (performance_dir / f"{version}_scaler.pkl")
     output_dir = args.output_dir or (performance_dir / "data_test")
     stem = args.data_path.stem
