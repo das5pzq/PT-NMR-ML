@@ -33,7 +33,8 @@ if __name__ == "__main__":
 
     df = pd.read_parquet(data_path)
     
-    signal_cols = df.columns[0:512]
+    n_bins = 512
+    signal_cols = df.columns[0:n_bins]
 
     scaler_path = f"{performance_dir}/{version}_scaler.pkl"
     if os.path.isfile(scaler_path):
@@ -77,11 +78,12 @@ if __name__ == "__main__":
     learning_rate = 3e-4
     max_epochs   = 500
     hidden_dim   = 256
+    num_blocks   = 2
     batch_size   = 256
     weight_decay = 1e-5
 
     print("\n" + "=" * 60)
-    print("Training MLP Model")
+    print(f"Training PolMLP  bins={n_bins} hidden={hidden_dim} blocks={num_blocks}")
     print("=" * 60)
 
     model, _history = train_model(
@@ -90,6 +92,7 @@ if __name__ == "__main__":
         learning_rate=learning_rate,
         max_epochs=max_epochs,
         hidden_dim=hidden_dim,
+        num_blocks=num_blocks,
         batch_size=batch_size,
         weight_decay=weight_decay,
     )

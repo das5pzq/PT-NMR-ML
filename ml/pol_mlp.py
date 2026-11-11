@@ -205,6 +205,16 @@ def save_checkpoint(path, *, model, optimizer, scheduler, epoch, best_val_loss,
             "max_epochs": max_epochs,
             "weight_decay": weight_decay,
             "history": history,
+            **(
+                {
+                    "hidden": model.hidden,
+                    "num_blocks": model.num_blocks,
+                    "num_bins": model.num_bins,
+                    "input_size": model.input_size,
+                }
+                if hasattr(model, "num_bins")
+                else {}
+            ),
         },
         path,
     )
@@ -288,6 +298,7 @@ def _load_or_create_model(
     learning_rate,
     max_epochs,
     weight_decay=1e-5,
+    num_blocks=2,
     device=None,
 ):
     if device is None:
@@ -301,12 +312,19 @@ def _load_or_create_model(
 
     if resume_path is None:
         print("No existing model found. Building new model...", flush=True)
+        net = PolMLP(
+            input_size=1,
+            hidden=hidden_dim,
+            num_blocks=num_blocks,
+            num_bins=input_dim,
+        )
         model = FFLightningModule(
             input_dim=input_dim,
             hidden_dim=hidden_dim,
             learning_rate=learning_rate,
             max_epochs=max_epochs,
             weight_decay=weight_decay,
+            model=net,
         ).to(device)
         return model, None
 
@@ -356,7 +374,7 @@ def _run_epoch(model, loader, device, optimizer=None):
 def train_model(X_train, y_train, X_val, y_val, X_test, y_test,
                 model_dir, performance_dir, version,
                 learning_rate=1e-3, max_epochs=500,
-                hidden_dim=256, batch_size=256, weight_decay=1e-5,
+                hidden_dim=256, num_blocks=2, batch_size=256, weight_decay=1e-5,
                 device=None):
 
     if device is None:
@@ -387,6 +405,7 @@ def train_model(X_train, y_train, X_val, y_val, X_test, y_test,
         learning_rate,
         max_epochs,
         weight_decay,
+        num_blocks=num_blocks,
         device=device,
     )
 

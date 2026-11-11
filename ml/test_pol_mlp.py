@@ -23,7 +23,6 @@ DEFAULT_DATA = (
     / "2022-09-23_00-54-02__2022-09-23_14-13-02.txt"
 )
 SIGNAL_KEY = "phase"
-N_BINS = 512
 
 
 def load_records(path):
@@ -34,9 +33,9 @@ def load_records(path):
 def load_model(checkpoint_path, device):
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    model, _ = load_model_from_checkpoint(str(checkpoint_path), device=device)
+    model, ckpt = load_model_from_checkpoint(str(checkpoint_path), device=device)
     model.eval()
-    return model
+    return model, ckpt
 
 
 def load_scaler(scaler_path):
@@ -46,7 +45,16 @@ def load_scaler(scaler_path):
         return pickle.load(f)
 
 
-def records_to_features(records, scaler, signal_key=SIGNAL_KEY, n_bins=N_BINS):
+def _match_bins(spectra, n_bins):
+    spectra = np.asarray(spectra, dtype=np.float32)
+    if spectra.shape[1] == n_bins:
+        return spectra
+    src = np.linspace(0.0, 1.0, spectra.shape[1])
+    dst = np.linspace(0.0, 1.0, n_bins)
+    return np.vstack([np.interp(dst, src, row) for row in spectra]).astype(np.float32)
+
+
+def records_to_features(records, n_bins, scaler=None, ps_mean=None, ps_std=None, signal_key=SIGNAL_KEY):
     spectra = []
     exp_p = []
     meta = []
@@ -55,12 +63,7 @@ def records_to_features(records, scaler, signal_key=SIGNAL_KEY, n_bins=N_BINS):
         signal = record.get(signal_key)
         if signal is None:
             raise KeyError(f"Event {idx} missing '{signal_key}'")
-        signal = np.asarray(signal, dtype=np.float32)
-        if signal.shape[0] != n_bins:
-            raise ValueError(
-                f"Event {idx} has {signal.shape[0]} bins; expected {n_bins}"
-            )
-        spectra.append(signal)
+        spectra.append(np.asarray(signal, dtype=np.float32))
         exp_p.append(record["pol"])
         meta.append(
             {
@@ -73,7 +76,11 @@ def records_to_features(records, scaler, signal_key=SIGNAL_KEY, n_bins=N_BINS):
             }
         )
 
-    X = scaler.transform(np.stack(spectra, axis=0))
+    X = _match_bins(np.stack(spectra, axis=0), n_bins)
+    if ps_mean is not None:
+        X = (X - np.float32(ps_mean)) / np.float32(ps_std)
+    elif scaler is not None:
+        X = scaler.transform(X)
     y_exp = np.asarray(exp_p, dtype=np.float32)
     return X, y_exp, meta
 
@@ -83,8 +90,9 @@ def predict(model, X, batch_size, device):
     preds = []
     for start in range(0, len(X), batch_size):
         batch = torch.from_numpy(X[start : start + batch_size]).to(device)
-        preds.append(model(batch).cpu().numpy())
-    return np.concatenate(preds, axis=0).reshape(-1)
+        out = model(batch).cpu().numpy()
+        preds.append(out[:, 0] if out.ndim == 2 else out)
+    return np.concatenate(preds, axis=0)
 
 
 def compute_summary(exp_frac, pred_frac):
@@ -214,15 +222,29 @@ def main():
 
     device = resolve_device(args.device)
     print(f"Loading model from {checkpoint_path}")
-    print(f"Loading scaler from {scaler_path}")
     print(f"Loading events from {args.data_path}")
     print(f"Using device: {device}")
 
-    model = load_model(checkpoint_path, device)
-    scaler = load_scaler(scaler_path)
+    model, ckpt = load_model(checkpoint_path, device)
+    net = model.model
+    n_bins = int(getattr(net, "num_bins", ckpt.get("input_dim", 512)))
+    stats = ckpt.get("stats") or {}
+    if "ps_mean" in stats and "ps_std" in stats:
+        print(
+            f"Z-scoring spectra with checkpoint stats "
+            f"(ps_mean={stats['ps_mean']}, ps_std={stats['ps_std']})",
+        )
+        scaler = None
+        ps_mean, ps_std = stats["ps_mean"], stats["ps_std"]
+    else:
+        print(f"Loading scaler from {scaler_path}")
+        scaler = load_scaler(scaler_path)
+        ps_mean = ps_std = None
     records = load_records(args.data_path)
 
-    X, y_exp, meta = records_to_features(records, scaler, signal_key=SIGNAL_KEY)
+    X, y_exp, meta = records_to_features(
+        records, n_bins, scaler=scaler, ps_mean=ps_mean, ps_std=ps_std, signal_key=SIGNAL_KEY,
+    )
     y_pred = predict(model, X, batch_size=args.batch_size, device=device)
     summary = compute_summary(y_exp, y_pred)
 
