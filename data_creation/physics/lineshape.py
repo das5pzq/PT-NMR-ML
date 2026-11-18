@@ -207,10 +207,6 @@ def GenerateVectorLineshape(P,x, CC, eta, phi, g):
 
     return signal,Iplus,Iminus
 
-import numpy as np
-
-import numpy as np
-
 def DulyaFit(
     x,
     P,
